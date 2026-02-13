@@ -217,7 +217,7 @@ def compute_storage_scaffold(gaussians):
         Features  = N * fd * 4,
         Scaling   = N * sd * 4,
         Offsets   = N * noff * 3 * 4,
-        Positions = N * 3 * 4,
+        Locations = N * 3 * 4,
         Rotation  = N * rd * 4,
         Opacity   = N * 1 * 4,
     )
@@ -279,25 +279,40 @@ def compute_storage_hac(gaussians, anchor_mask=None, batch_size=4096):
     bytes_scaling = total_bits_s / 8
     bytes_offsets = total_bits_o / 8
 
-    # ---- 2. Hash Grid – binary entropy ----
+    # ---- 2. Hash Grid – binary entropy from +/-1 symbol frequency ----
     hash_bits = 0.0
     tables = [lv.hash_table for lv in gaussians.hash_grid.levels_3d]
     for lv in gaussians.hash_grid.levels_2d:
         tables.extend([lv.table_xy, lv.table_xz, lv.table_yz])
     for t in tables:
-        p   = torch.sigmoid(t)
-        ent = -p * torch.log2(p + 1e-10) - (1 - p) * torch.log2(1 - p + 1e-10)
-        hash_bits += ent.sum().item()
+        # Estimate coding rate by the empirical symbol distribution after
+        # binarization: +1 if t>=0 else -1.
+        sym = (t >= 0).float()
+        p_plus = sym.mean().item()
+        p_minus = 1.0 - p_plus
+        eps = 1e-10
+        h = 0.0
+        if p_plus > 0:
+            h -= p_plus * np.log2(p_plus + eps)
+        if p_minus > 0:
+            h -= p_minus * np.log2(p_minus + eps)
+        hash_bits += h * t.numel()
     bytes_hash = hash_bits / 8
 
-    # ---- 3. Anchor positions (float16 estimate) ----
-    bytes_pos = N_valid * 3 * 2
+    # ---- 3. Anchor locations (quantized estimate, GPCC-like proxy) ----
+    # Use 16-bit quantized xyz as a simple geometry coding proxy.
+    bytes_loc = N_valid * 3 * 2
 
-    # ---- 4. Rotation + Opacity (float16, not entropy-coded) ----
+    # ---- 4. Binary masks (anchor-level + offset-level) ----
+    # Anchor mask: 1 bit / anchor. Offset mask: 1 bit / offset.
+    # Use conservative raw bit count as binary-compressed estimate.
+    bytes_masks = (N + N * gaussians.n_offsets) / 8.0
+
+    # ---- 5. Rotation + Opacity (float16, not entropy-coded) ----
     rd = gaussians._rotation.shape[1]
     bytes_rot_op = N_valid * (rd + 1) * 2
 
-    # ---- 5. Rendering MLPs (shared overhead, float32) ----
+    # ---- 6. Rendering MLPs (shared overhead, float32) ----
     mlp_bytes = 0
     mlp_bytes += _count_module_bytes(gaussians.mlp_opacity)
     mlp_bytes += _count_module_bytes(gaussians.mlp_cov)
@@ -307,15 +322,16 @@ def compute_storage_hac(gaussians, anchor_mask=None, batch_size=4096):
     if gaussians.appearance_dim > 0 and gaussians.embedding_appearance is not None:
         mlp_bytes += _count_module_bytes(gaussians.embedding_appearance)
 
-    # ---- 6. Context model (decoding overhead, float32) ----
+    # ---- 7. Context model (decoding overhead, float32) ----
     ctx_bytes = _count_module_bytes(gaussians.context_model)
 
     breakdown = dict(
         Features        = bytes_feat,
         Scaling         = bytes_scaling,
         Offsets         = bytes_offsets,
-        Positions       = bytes_pos,
+        Locations       = bytes_loc,
         HashGrid        = bytes_hash,
+        Masks           = bytes_masks,
         Networks        = mlp_bytes + ctx_bytes + bytes_rot_op,
     )
     total = sum(breakdown.values())
@@ -522,7 +538,7 @@ def plot_storage_decomposition(results, output_dir):
     # ---- collect per-model component vectors ----
     model_labels = []
     components   = ["Features", "Offsets", "Scaling",
-                    "Positions", "HashGrid", "Networks"]
+                    "Locations", "HashGrid", "Masks", "Networks"]
     comp_data    = {c: [] for c in components}
 
     # Scaffold-GS (HashGrid = 0)
@@ -531,8 +547,9 @@ def plot_storage_decomposition(results, output_dir):
     comp_data["Features"].append(sg_bd.get("Features", 0))
     comp_data["Offsets"].append(sg_bd.get("Offsets", 0))
     comp_data["Scaling"].append(sg_bd.get("Scaling", 0))
-    comp_data["Positions"].append(sg_bd.get("Positions", 0))
+    comp_data["Locations"].append(sg_bd.get("Locations", 0))
     comp_data["HashGrid"].append(0.0)
+    comp_data["Masks"].append(0.0)
     # group Rotation + Opacity + Networks into "Networks"
     net = (sg_bd.get("Networks", 0)
            + sg_bd.get("Rotation", 0)
@@ -551,7 +568,7 @@ def plot_storage_decomposition(results, output_dir):
     x      = np.arange(len(model_labels))
     width  = 0.50
     colors = ["#EF5350", "#42A5F5", "#66BB6A",
-              "#FFA726", "#AB47BC", "#78909C"]
+              "#FFA726", "#AB47BC", "#8D6E63", "#78909C"]
     bottom = np.zeros(len(model_labels))
 
     for ci, comp in enumerate(components):
