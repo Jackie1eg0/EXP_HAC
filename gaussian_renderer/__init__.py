@@ -19,17 +19,12 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     ## view frustum filtering for acceleration    
     if visible_mask is None:
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
-<<<<<<< HEAD
     
     # HAC++: use quantised attributes when hac_mode > 0
     # Rendering always uses Quantize(f^a), NOT MLP(f^h).
     # MLP(f^h) is only used for entropy loss, not for rendering.
     anchor = pc.get_anchor[visible_mask]
     feat, grid_scaling, grid_offsets = pc.get_quantized_attributes(visible_mask)
-=======
-
-    anchor = pc.get_anchor[visible_mask]
->>>>>>> ffc36287e62f712c497f95a743ef63af3a302a18
 
     ## get view properties for anchor
     ob_view = anchor - viewpoint_camera.camera_center

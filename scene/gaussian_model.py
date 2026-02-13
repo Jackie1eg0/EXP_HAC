@@ -23,9 +23,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
-<<<<<<< HEAD
 from scene.hac_model import BinaryHashGrid, HACContextModel
-=======
 from scene.hac_modules import (
     MultiResolutionHashGrid,
     ContextMLP,
@@ -33,7 +31,6 @@ from scene.hac_modules import (
     FactorizedEntropyModel,
     RateDistortionLoss,
 )
->>>>>>> ffc36287e62f712c497f95a743ef63af3a302a18
 
     
 class GaussianModel:
@@ -244,15 +241,12 @@ class GaussianModel:
                 self.mlp_feature_bank.eval()
         if self.appearance_dim > 0:
             self.embedding_appearance.eval()
-<<<<<<< HEAD
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
         if self.hash_grid is not None:
             self.hash_grid.eval()
         if self.context_model is not None:
             self.context_model.eval()
-=======
->>>>>>> ffc36287e62f712c497f95a743ef63af3a302a18
 
     def train(self):
         if self.use_hash_grid:
@@ -266,15 +260,12 @@ class GaussianModel:
                 self.mlp_feature_bank.train()
         if self.appearance_dim > 0:
             self.embedding_appearance.train()
-<<<<<<< HEAD
         if self.use_feat_bank:                   
             self.mlp_feature_bank.train()
         if self.hash_grid is not None:
             self.hash_grid.train()
         if self.context_model is not None:
             self.context_model.train()
-=======
->>>>>>> ffc36287e62f712c497f95a743ef63af3a302a18
 
     def capture(self):
         return (
@@ -744,23 +735,16 @@ class GaussianModel:
             if self.appearance_dim > 0 and param_group["name"] == "embedding_appearance":
                 lr = self.appearance_scheduler_args(iteration)
                 param_group['lr'] = lr
-<<<<<<< HEAD
-            if self.hac_mode >= 2:
-                if param_group["name"] == "hash_grid":
-                    lr = self.hash_grid_scheduler_args(iteration)
-                    param_group['lr'] = lr
-                if param_group["name"] == "context_model":
-                    lr = self.context_model_scheduler_args(iteration)
-                    param_group['lr'] = lr
-=======
             # ---- HAC++ 学习率调度 ----
             if self.use_hash_grid:
                 if param_group["name"] == "hash_grid":
                     param_group['lr'] = self.hash_grid_scheduler_args(iteration)
                 if param_group["name"] == "context_mlp":
                     param_group['lr'] = self.context_mlp_scheduler_args(iteration)
-            
->>>>>>> ffc36287e62f712c497f95a743ef63af3a302a18
+            if self.hac_mode >= 2:
+                if param_group["name"] == "context_model":
+                    lr = self.context_model_scheduler_args(iteration)
+                    param_group['lr'] = lr
             
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -870,16 +854,7 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-<<<<<<< HEAD
-            if  'mlp' in group['name'] or \
-                'conv' in group['name'] or \
-                'feat_base' in group['name'] or \
-                'embedding' in group['name'] or \
-                'hash' in group['name'] or \
-                'context' in group['name']:
-=======
             if self._is_neural_param_group(group['name']):
->>>>>>> ffc36287e62f712c497f95a743ef63af3a302a18
                 continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
@@ -929,16 +904,7 @@ class GaussianModel:
     def _prune_anchor_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-<<<<<<< HEAD
-            if  'mlp' in group['name'] or \
-                'conv' in group['name'] or \
-                'feat_base' in group['name'] or \
-                'embedding' in group['name'] or \
-                'hash' in group['name'] or \
-                'context' in group['name']:
-=======
             if self._is_neural_param_group(group['name']):
->>>>>>> ffc36287e62f712c497f95a743ef63af3a302a18
                 continue
 
             stored_state = self.optimizer.state.get(group['params'][0], None)
