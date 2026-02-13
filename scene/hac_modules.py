@@ -210,11 +210,18 @@ class MultiResolutionHashGrid(nn.Module):
         """
         N = positions.shape[0]
 
-        # 小数据或推理模式: 直接计算, 不分块
-        if N <= chunk_size or not torch.is_grad_enabled():
+        # 小数据: 直接计算, 不分块
+        if N <= chunk_size:
             return self._forward_chunk(positions)
 
-        # 分块 + 梯度检查点
+        if not torch.is_grad_enabled():
+            # 推理模式: 仍然分块以控制峰值显存, 但不需要梯度检查点
+            outputs = []
+            for i in range(0, N, chunk_size):
+                outputs.append(self._forward_chunk(positions[i:i + chunk_size]))
+            return torch.cat(outputs, dim=0)
+
+        # 训练模式: 分块 + 梯度检查点
         outputs = []
         for i in range(0, N, chunk_size):
             chunk_pos = positions[i:i + chunk_size]

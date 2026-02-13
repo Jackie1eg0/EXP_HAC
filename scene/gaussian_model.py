@@ -354,7 +354,8 @@ class GaussianModel:
     #  HAC++ 核心方法
     # ==============================================================
 
-    def decode_anchor_attributes(self, anchor_positions: torch.Tensor, is_training: bool = True):
+    def decode_anchor_attributes(self, anchor_positions: torch.Tensor, is_training: bool = True,
+                                   chunk_size: int = 8192):
         """
         [HAC++ 专用] 通过 HashGrid + ContextMLP Stage 1 解码锚点级属性。
 
@@ -366,6 +367,7 @@ class GaussianModel:
         Args:
             anchor_positions: [N, 3]  锚点世界坐标
             is_training:      bool    是否训练模式 (影响量化行为)
+            chunk_size:       int     分块大小 (控制峰值显存)
 
         Returns:
             decoded: dict  包含锚点属性
@@ -383,8 +385,19 @@ class GaussianModel:
         # Step 1: 哈希网格查询 (已内置分块 + 梯度检查点)
         hash_features = self.hash_grid(anchor_positions)  # [N, hash_out_dim]
 
-        # Step 2: Context MLP Stage 1 — 几何属性解码 (使用梯度检查点)
-        if is_training and torch.is_grad_enabled():
+        # Step 2: Context MLP Stage 1 — 几何属性解码
+        # 分块处理以控制显存峰值
+        if N > chunk_size and not is_training:
+            # 推理: 分块解码，不需要梯度
+            geom_chunks = []
+            for i in range(0, N, chunk_size):
+                geom_chunks.append(self.context_mlp.decode_geometry(hash_features[i:i+chunk_size]))
+            # 合并所有 chunk 的 dict
+            geom = {}
+            for key in geom_chunks[0]:
+                geom[key] = torch.cat([c[key] for c in geom_chunks], dim=0)
+            del geom_chunks
+        elif is_training and torch.is_grad_enabled():
             geom = grad_checkpoint(
                 self.context_mlp.decode_geometry, hash_features,
                 use_reentrant=False

@@ -70,7 +70,8 @@ def build_split_configs(split_mode, llffhold_values, lod_values):
     return split_cfgs
 
 
-def get_experiments(scene_name, data_root, output_root="outputs", split_cfgs=None, lambda_rates=None):
+def get_experiments(scene_name, data_root, output_root="outputs", split_cfgs=None, lambda_rates=None,
+                    voxel_size=0.001, resolution=-1):
     """
     定义所有需要运行和对比的实验配置。
 
@@ -83,12 +84,14 @@ def get_experiments(scene_name, data_root, output_root="outputs", split_cfgs=Non
     base_args = [
         "--eval",
         "-s", data_path,
-        "--voxel_size", "0.001",
+        "--voxel_size", str(voxel_size),
         "--update_init_factor", "16",
         "--appearance_dim", "0",
         "--ratio", "1",
         "--iterations", "30000",
     ]
+    if resolution > 0:
+        base_args += ["-r", str(resolution)]
 
     experiments = []
     split_cfgs = split_cfgs if split_cfgs is not None else [dict(tag="", name="llffhold=8", extra_args=["--llffhold", "8", "--lod", "0"])]
@@ -632,6 +635,10 @@ def main():
     parser.add_argument("--lambda_rates", nargs="+", type=float,
                         default=[1e-4, 5e-4, 1e-3],
                         help="HAC++ lambda_rate 列表 (消融实验: 不同压缩强度)")
+    parser.add_argument("--voxel_size", type=float, default=0.001,
+                        help="体素大小 (越大锚点越少, 越省显存; 默认 0.001)")
+    parser.add_argument("--resolution", type=int, default=-1,
+                        help="图像分辨率缩放 (1=原始, 2=半分辨率, 4=1/4; 默认 -1 自动)")
     parser.add_argument("--collect_only", action="store_true", help="仅收集已有结果,不重新训练")
     parser.add_argument("--skip_baseline", action="store_true", help="跳过 Scaffold-GS 基线训练")
     args = parser.parse_args()
@@ -643,6 +650,8 @@ def main():
         args.output_root,
         split_cfgs=split_cfgs,
         lambda_rates=args.lambda_rates,
+        voxel_size=args.voxel_size,
+        resolution=args.resolution,
     )
 
     # ---- 打印实验配置与数据划分信息 ----
@@ -686,8 +695,12 @@ def main():
             cmd = exp['cmd'] + ["--gpu", args.gpu]
             print(f"  命令: {' '.join(cmd)}\n")
 
+            # 设置 CUDA 显存分配优化, 减少碎片化导致的 OOM
+            env = os.environ.copy()
+            env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
             try:
-                subprocess.run(cmd, check=True)
+                subprocess.run(cmd, check=True, env=env)
             except subprocess.CalledProcessError as e:
                 print(f"  [错误] 实验失败: {e}")
                 continue

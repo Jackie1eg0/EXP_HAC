@@ -19,12 +19,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     ## view frustum filtering for acceleration    
     if visible_mask is None:
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
-    
-    # HAC++: use quantised attributes when hac_mode > 0
-    # Rendering always uses Quantize(f^a), NOT MLP(f^h).
-    # MLP(f^h) is only used for entropy loss, not for rendering.
+
     anchor = pc.get_anchor[visible_mask]
-    feat, grid_scaling, grid_offsets = pc.get_quantized_attributes(visible_mask)
 
     ## get view properties for anchor
     ob_view = anchor - viewpoint_camera.camera_center
@@ -33,9 +29,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # ================================================================
     #  HAC++ 路径: HashGrid → ContextMLP (两阶段) → AQM
+    #  注意: 此路径不调用 get_quantized_attributes, 避免双重解码显存浪费
     # ================================================================
     if pc.use_hash_grid:
-        # Stage 1: 从 anchor 位置解码几何属性
+        # Stage 1: 从 anchor 位置解码几何属性 (唯一一次 hash grid 查询)
         decoded, rate_dict = pc.decode_anchor_attributes(anchor, is_training=is_training)
         feat = decoded['anchor_feat']             # [N, feat_dim]  (已量化)
         grid_offsets = decoded['offsets'].view(-1, pc.n_offsets, 3)  # [N, k, 3]
@@ -63,7 +60,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         del appear  # 释放 dict
 
     # ================================================================
-    #  原始 Scaffold-GS 路径
+    #  原始 Scaffold-GS 路径 (或 hac_mode 0/1 回退)
     # ================================================================
     else:
         rate_dict = {}
@@ -107,6 +104,9 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             scale_rot = pc.get_cov_mlp(cat_local_view)
         else:
             scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
+        
+        # 释放中间变量
+        del cat_local_view, cat_local_view_wodist
 
     # ================================================================
     #  以下为两种模式的公共后处理
@@ -120,15 +120,25 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     mask = mask.view(-1)
     opacity = neural_opacity[mask]
 
+    # 释放解码阶段不再需要的变量, 为光栅化器腾出显存
+    del feat
+    if 'ob_view' in dir():
+        pass  # ob_view 已在局部作用域结束
+
     # offsets
     offsets = grid_offsets.view([-1, 3])
     
     # combine for parallel masking
     concatenated = torch.cat([grid_scaling, anchor], dim=-1)
+    del grid_scaling  # 已合并, 不再需要
     concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
+    del concatenated
     concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
+    del concatenated_repeated, offsets
     masked = concatenated_all[mask]
+    del concatenated_all
     scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
+    del masked
     
     # post-process cov
     scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3])
@@ -186,7 +196,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-    
+
+    # 释放 PyTorch 缓存的未使用显存, 为光栅化器的大缓冲区腾空间
+    torch.cuda.empty_cache()
+
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii = rasterizer(
         means3D = xyz,
