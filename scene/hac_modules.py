@@ -189,7 +189,7 @@ class MultiResolutionHashGrid(nn.Module):
         return result.reshape(M, -1)
 
     # ------------------------------------------------------------------
-    def forward(self, positions: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
+    def forward(self, positions: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
         """
         显存优化的前向传播: 分块处理 + 梯度检查点。
 
