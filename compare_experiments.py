@@ -1,17 +1,23 @@
 """
-Scaffold-GS vs HAC++ 对比实验脚本
+Scaffold-GS vs HAC++ 消融实验与对比评测脚本
 
 功能:
-  1. 自动运行 Scaffold-GS (原版) 和 HAC++ (多组 lambda_rate) 实验
-  2. 收集所有实验的质量指标 (PSNR / SSIM / LPIPS)
-  3. 统计模型大小 (ply + 网络权重)
-  4. 输出对比表格 + 率失真曲线数据
+  1. 按 llffhold=8 (每隔8张取一张测试) 划分训练集和测试集
+  2. 自动运行 Scaffold-GS (基线) 和 HAC++ (多组 lambda_rate) 实验
+  3. 收集所有实验的 PSNR / SSIM / LPIPS / Model Size
+  4. 生成消融对比表格 + 柱状图 + 率失真曲线
+  5. 自动输出消融结论: HAC++ 在保证压缩率的同时保持与 Scaffold-GS 相近的性能
 
 用法:
+  # 完整训练+评测+绘图
   python compare_experiments.py --scene flowers --data_root data/mipnerf360 --gpu 0
 
-  或者只收集已有结果 (不重新训练):
+  # 只收集已有结果并生成图表
   python compare_experiments.py --scene flowers --data_root data/mipnerf360 --collect_only
+
+  # 自定义 lambda 做消融
+  python compare_experiments.py --scene flowers --data_root data/mipnerf360 \\
+      --lambda_rates 1e-4 5e-4 1e-3 --gpu 0
 """
 
 import os
@@ -19,8 +25,14 @@ import sys
 import json
 import argparse
 import subprocess
+import numpy as np
 from pathlib import Path
 from collections import OrderedDict
+from datetime import datetime
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # ====================================================================
 #  配置: 需要运行的实验列表
@@ -80,7 +92,7 @@ def get_experiments(scene_name, data_root, output_root="outputs", split_cfgs=Non
 
     experiments = []
     split_cfgs = split_cfgs if split_cfgs is not None else [dict(tag="", name="llffhold=8", extra_args=["--llffhold", "8", "--lod", "0"])]
-    lambda_rates = lambda_rates if lambda_rates is not None else [0.0, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3]
+    lambda_rates = lambda_rates if lambda_rates is not None else [1e-4, 5e-4, 1e-3]
 
     for split in split_cfgs:
         split_prefix = f"{output_root}/{scene_name}"
@@ -304,6 +316,305 @@ def export_rd_curve_data(all_results: list, output_file: str):
 
 
 # ====================================================================
+#  消融实验: 绘图模块
+# ====================================================================
+
+def plot_ablation_comparison(all_results: list, output_dir: str, scene_name: str):
+    """
+    生成消融实验的核心对比图:
+      Figure 1: PSNR / SSIM 分组柱状图 (左轴 PSNR, 右轴 SSIM)
+      Figure 2: 模型大小柱状图 + 压缩比标注
+      Figure 3: 率失真散点图 (Size vs PSNR)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ---- 过滤有效结果 ----
+    valid = [(n, r) for n, r in all_results if r['psnr'] is not None]
+    if not valid:
+        print("  [WARNING] 没有有效的实验结果, 跳过绘图")
+        return
+
+    names   = [n.split("] ")[-1] if "] " in n else n for n, _ in valid]
+    psnrs   = [r['psnr']  for _, r in valid]
+    ssims   = [r['ssim']  for _, r in valid]
+    lpipss  = [r['lpips'] for _, r in valid]
+    sizes   = [r['total_size_mb'] for _, r in valid]
+
+    # 颜色: Scaffold-GS 红色, HAC++ 蓝色系
+    colors = []
+    for n, _ in valid:
+        if 'Baseline' in n or 'Scaffold' in n:
+            colors.append('#E53935')
+        else:
+            colors.append('#1E88E5')
+
+    x = np.arange(len(names))
+    bar_w = 0.55
+
+    # ======== Figure 1: PSNR + SSIM 对比 ========
+    fig, ax1 = plt.subplots(figsize=(max(8, 2.2 * len(names)), 6))
+    bars = ax1.bar(x, psnrs, bar_w, color=colors, edgecolor='white',
+                   linewidth=0.8, alpha=0.9, zorder=3)
+    ax1.set_ylabel('PSNR (dB) ↑', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Method', fontsize=12)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(names, rotation=18, ha='right', fontsize=9)
+    ax1.grid(axis='y', alpha=0.3, zorder=0)
+
+    # 在柱子上标数值
+    for bar, p in zip(bars, psnrs):
+        ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.08,
+                 f'{p:.2f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    # 右轴: SSIM
+    ax2 = ax1.twinx()
+    ax2.plot(x, ssims, 's--', color='#43A047', markersize=8,
+             linewidth=2, label='SSIM', zorder=5)
+    for i, s in enumerate(ssims):
+        ax2.annotate(f'{s:.4f}', (x[i], s),
+                     textcoords='offset points', xytext=(0, 10),
+                     fontsize=8, color='#2E7D32', ha='center')
+    ax2.set_ylabel('SSIM ↑', fontsize=12, color='#43A047', fontweight='bold')
+    ax2.tick_params(axis='y', labelcolor='#43A047')
+
+    fig.suptitle(f'Ablation: HAC++ vs Scaffold-GS  –  {scene_name}\n'
+                 f'(Train/Test split: every 8th image as test)',
+                 fontsize=13, fontweight='bold')
+    ax2.legend(loc='lower right', fontsize=10)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.savefig(os.path.join(output_dir, 'ablation_psnr_ssim.png'), dpi=200)
+    fig.savefig(os.path.join(output_dir, 'ablation_psnr_ssim.pdf'))
+    plt.close(fig)
+    print(f"  Saved: ablation_psnr_ssim.png/.pdf")
+
+    # ======== Figure 2: 模型大小 + 压缩比 ========
+    # 找到 baseline 大小
+    baseline_size = None
+    for n, r in valid:
+        if 'Baseline' in n or 'Scaffold' in n:
+            baseline_size = r['total_size_mb']
+            break
+
+    fig, ax = plt.subplots(figsize=(max(8, 2.2 * len(names)), 6))
+    bars = ax.bar(x, sizes, bar_w, color=colors, edgecolor='white',
+                  linewidth=0.8, alpha=0.9, zorder=3)
+
+    for bar, sz in zip(bars, sizes):
+        label = f'{sz:.1f} MB'
+        if baseline_size and baseline_size > 0 and sz < baseline_size * 0.99:
+            ratio = baseline_size / sz
+            label += f'\n({ratio:.1f}x)'
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + max(sizes) * 0.01,
+                label, ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    ax.set_ylabel('Model Size (MB) ↓', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Method', fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=18, ha='right', fontsize=9)
+    ax.grid(axis='y', alpha=0.3, zorder=0)
+    ax.set_title(f'Storage Comparison  –  {scene_name}', fontsize=13, fontweight='bold')
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, 'ablation_size.png'), dpi=200)
+    fig.savefig(os.path.join(output_dir, 'ablation_size.pdf'))
+    plt.close(fig)
+    print(f"  Saved: ablation_size.png/.pdf")
+
+    # ======== Figure 3: 率失真散点图 (Size vs PSNR) ========
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for i, (n, r) in enumerate(valid):
+        is_baseline = ('Baseline' in n or 'Scaffold' in n)
+        marker = '*' if is_baseline else 'o'
+        ms = 250 if is_baseline else 120
+        c = '#E53935' if is_baseline else '#1E88E5'
+        label = names[i]
+        ax.scatter(r['total_size_mb'], r['psnr'], s=ms, c=c,
+                   marker=marker, edgecolors='black', linewidths=0.8,
+                   zorder=5, label=label)
+        ax.annotate(names[i],
+                    (r['total_size_mb'], r['psnr']),
+                    textcoords='offset points',
+                    xytext=(10, 5) if is_baseline else (10, -12),
+                    fontsize=8, alpha=0.85)
+
+    # HAC++ 连线 (仅连 HAC 的点)
+    hac_pts = [(r['total_size_mb'], r['psnr'])
+               for n, r in valid if 'HAC' in n]
+    if len(hac_pts) > 1:
+        hac_pts.sort()
+        hx, hy = zip(*hac_pts)
+        ax.plot(hx, hy, '--', color='#1E88E5', linewidth=1.5, alpha=0.6, zorder=3)
+
+    ax.set_xlabel('Model Size (MB) →', fontsize=12)
+    ax.set_ylabel('PSNR (dB) ↑', fontsize=12)
+    ax.set_title(f'Rate-Distortion Curve  –  {scene_name}', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9, loc='lower right')
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, 'ablation_rd_curve.png'), dpi=200)
+    fig.savefig(os.path.join(output_dir, 'ablation_rd_curve.pdf'))
+    plt.close(fig)
+    print(f"  Saved: ablation_rd_curve.png/.pdf")
+
+    # ======== Figure 4: 综合对比雷达图 (PSNR/SSIM/LPIPS/Size 归一化) ========
+    if len(valid) >= 2 and all(r['lpips'] is not None for _, r in valid):
+        fig, ax = plt.subplots(figsize=(10, 5))
+        # 归一化到 [0, 1]: PSNR/SSIM 越高越好, LPIPS/Size 越低越好
+        p_min, p_max = min(psnrs), max(psnrs)
+        s_min, s_max = min(ssims), max(ssims)
+        l_min, l_max = min(lpipss), max(lpipss)
+        z_min, z_max = min(sizes), max(sizes)
+
+        metrics_labels = ['PSNR ↑', 'SSIM ↑', '1-LPIPS ↑', 'Compression ↑']
+        table_data = []
+        for i, (n, r) in enumerate(valid):
+            p_norm = (r['psnr'] - p_min) / (p_max - p_min + 1e-8)
+            s_norm = (r['ssim'] - s_min) / (s_max - s_min + 1e-8)
+            l_norm = 1.0 - (r['lpips'] - l_min) / (l_max - l_min + 1e-8)  # 反转
+            z_norm = 1.0 - (r['total_size_mb'] - z_min) / (z_max - z_min + 1e-8)  # 反转
+            table_data.append([f'{r["psnr"]:.2f}', f'{r["ssim"]:.4f}',
+                               f'{r["lpips"]:.4f}', f'{r["total_size_mb"]:.1f} MB'])
+
+        # 用表格 + 文字形式展示
+        ax.axis('off')
+        col_labels = ['Method', 'PSNR (dB)↑', 'SSIM↑', 'LPIPS↓', 'Size (MB)↓']
+        cell_text = []
+        cell_colors = []
+        for i, (n, r) in enumerate(valid):
+            row = [names[i]] + table_data[i]
+            cell_text.append(row)
+            if 'Baseline' in n or 'Scaffold' in n:
+                cell_colors.append(['#FFCDD2'] * 5)
+            else:
+                cell_colors.append(['#BBDEFB'] * 5)
+
+        table = ax.table(cellText=cell_text, colLabels=col_labels,
+                         cellColours=cell_colors, cellLoc='center',
+                         loc='center', colColours=['#E0E0E0'] * 5)
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        table.scale(1.0, 1.8)
+
+        ax.set_title(f'Ablation Summary  –  {scene_name}\n'
+                     f'Data split: llffhold=8 (every 8th image as test)',
+                     fontsize=13, fontweight='bold', pad=20)
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, 'ablation_summary_table.png'), dpi=200)
+        fig.savefig(os.path.join(output_dir, 'ablation_summary_table.pdf'))
+        plt.close(fig)
+        print(f"  Saved: ablation_summary_table.png/.pdf")
+
+
+def print_ablation_conclusion(all_results: list, scene_name: str, output_dir: str):
+    """
+    自动生成消融实验结论: 证明 HAC++ 在大幅压缩的同时保持与 Scaffold-GS 相近的质量。
+    """
+    valid = [(n, r) for n, r in all_results if r['psnr'] is not None]
+    if not valid:
+        return
+
+    # 找到 Scaffold-GS baseline
+    baseline = None
+    for n, r in valid:
+        if 'Baseline' in n or 'Scaffold' in n:
+            baseline = (n, r)
+            break
+
+    if baseline is None:
+        print("  [WARNING] 未找到 Scaffold-GS 基线, 无法输出消融结论")
+        return
+
+    bl_name, bl = baseline
+    hac_results = [(n, r) for n, r in valid if 'HAC' in n]
+    if not hac_results:
+        print("  [WARNING] 未找到 HAC++ 结果, 无法输出消融结论")
+        return
+
+    lines = []
+    sep = "=" * 80
+    lines.append("")
+    lines.append(sep)
+    lines.append("  消融实验结论 (Ablation Conclusion)")
+    lines.append(sep)
+    lines.append(f"  场景: {scene_name}")
+    lines.append(f"  数据划分: llffhold=8 (每隔 8 张图片取 1 张作为测试集)")
+    lines.append(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    lines.append(f"  基线 Scaffold-GS:")
+    lines.append(f"    PSNR  = {bl['psnr']:.2f} dB")
+    lines.append(f"    SSIM  = {bl['ssim']:.4f}")
+    lines.append(f"    LPIPS = {bl['lpips']:.4f}" if bl['lpips'] else "    LPIPS = N/A")
+    lines.append(f"    Size  = {bl['total_size_mb']:.2f} MB")
+    lines.append("")
+    lines.append("-" * 80)
+    lines.append(f"  {'HAC++ Config':<28s} {'ΔPSNR(dB)':>10s} {'ΔSSIM':>10s}"
+                 f" {'Size(MB)':>10s} {'压缩比':>8s} {'结论':>10s}")
+    lines.append("-" * 80)
+
+    best_hac = None
+    best_score = -999
+
+    for n, r in hac_results:
+        short_name = n.split("] ")[-1] if "] " in n else n
+        dpsnr = r['psnr'] - bl['psnr']
+        dssim = r['ssim'] - bl['ssim'] if (r['ssim'] and bl['ssim']) else 0
+        ratio = bl['total_size_mb'] / r['total_size_mb'] if r['total_size_mb'] > 0 else 0
+
+        # 判定: PSNR 差在 1dB 内视为"相近"
+        if abs(dpsnr) <= 1.0:
+            verdict = "✓ 相近"
+        elif dpsnr > 0:
+            verdict = "✓ 更优"
+        else:
+            verdict = "△ 有差距"
+
+        sign_p = "+" if dpsnr >= 0 else ""
+        sign_s = "+" if dssim >= 0 else ""
+        lines.append(f"  {short_name:<28s} {sign_p}{dpsnr:>8.2f} {sign_s}{dssim:>9.4f}"
+                     f" {r['total_size_mb']:>10.2f} {ratio:>7.1f}x {verdict:>10s}")
+
+        # 挑选"最优 HAC++": 压缩比最高且 PSNR 差 <1dB
+        score = ratio if abs(dpsnr) <= 1.0 else ratio * 0.1
+        if score > best_score:
+            best_score = score
+            best_hac = (short_name, r, dpsnr, ratio)
+
+    lines.append("-" * 80)
+
+    if best_hac:
+        bname, br, bdp, bratio = best_hac
+        lines.append("")
+        lines.append(f"  >>> 最佳消融点: {bname}")
+        lines.append(f"      压缩比: {bratio:.1f}x (模型大小从 {bl['total_size_mb']:.1f}MB "
+                     f"→ {br['total_size_mb']:.1f}MB)")
+        sign = "+" if bdp >= 0 else ""
+        lines.append(f"      PSNR 变化: {sign}{bdp:.2f} dB (基线 {bl['psnr']:.2f} → {br['psnr']:.2f})")
+        lines.append(f"      SSIM: {br['ssim']:.4f} vs 基线 {bl['ssim']:.4f}")
+        lines.append("")
+        if abs(bdp) <= 0.5:
+            lines.append(f"  结论: HAC++ 实现了 {bratio:.1f}x 压缩, PSNR 几乎无损 ({sign}{bdp:.2f}dB),")
+            lines.append(f"        证明 HAC++ 能在保证高压缩率的同时维持与 Scaffold-GS 相当的渲染质量。")
+        elif abs(bdp) <= 1.0:
+            lines.append(f"  结论: HAC++ 实现了 {bratio:.1f}x 压缩, PSNR 仅下降 {abs(bdp):.2f}dB,")
+            lines.append(f"        在可接受范围内, 验证了 HAC++ 的压缩有效性。")
+        else:
+            lines.append(f"  结论: HAC++ 实现了 {bratio:.1f}x 压缩, 但 PSNR 下降 {abs(bdp):.2f}dB,")
+            lines.append(f"        建议尝试更小的 lambda_rate 以获得更好的质量-压缩平衡。")
+
+    lines.append("")
+    lines.append(sep)
+
+    conclusion_text = "\n".join(lines)
+    print(conclusion_text)
+
+    # 保存到文件
+    conclusion_file = os.path.join(output_dir, "ablation_conclusion.txt")
+    with open(conclusion_file, 'w', encoding='utf-8') as f:
+        f.write(conclusion_text)
+    print(f"  结论已保存到: {conclusion_file}")
+
+
+# ====================================================================
 #  主流程
 # ====================================================================
 
@@ -320,8 +631,8 @@ def main():
     parser.add_argument("--lod_values", nargs="+", type=int, default=[0],
                         help="当 split_mode=lod 时使用, 可传多个值做消融")
     parser.add_argument("--lambda_rates", nargs="+", type=float,
-                        default=[0.0, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3],
-                        help="HAC++ lambda_rate 列表")
+                        default=[1e-4, 5e-4, 1e-3],
+                        help="HAC++ lambda_rate 列表 (消融实验: 不同压缩强度)")
     parser.add_argument("--collect_only", action="store_true", help="仅收集已有结果,不重新训练")
     parser.add_argument("--skip_baseline", action="store_true", help="跳过 Scaffold-GS 基线训练")
     args = parser.parse_args()
@@ -334,6 +645,27 @@ def main():
         split_cfgs=split_cfgs,
         lambda_rates=args.lambda_rates,
     )
+
+    # ---- 打印实验配置与数据划分信息 ----
+    print("\n" + "=" * 80)
+    print("  消融实验配置")
+    print("=" * 80)
+    print(f"  场景:         {args.scene}")
+    print(f"  数据集路径:   {args.data_root}/{args.scene}")
+    print(f"  划分模式:     {args.split_mode}")
+    if args.split_mode == "llffhold":
+        print(f"  llffhold值:   {args.llffhold_values}")
+        print(f"  划分说明:     每隔 {args.llffhold_values[0]} 张图片取 1 张作为测试集")
+        print(f"                训练集 = idx % {args.llffhold_values[0]} != 0")
+        print(f"                测试集 = idx % {args.llffhold_values[0]} == 0")
+    else:
+        print(f"  lod值:        {args.lod_values}")
+    print(f"  HAC++ λ值:    {args.lambda_rates}")
+    print(f"  实验总数:     {len(experiments)}")
+    for i, exp in enumerate(experiments):
+        tag = "Baseline" if 'Baseline' in exp['name'] else "HAC++"
+        print(f"    [{i+1}] {tag:<10s} {exp['name']}")
+    print("=" * 80)
 
     # ---- 运行实验 ----
     if not args.collect_only:
@@ -380,30 +712,31 @@ def main():
     print_comparison_table(all_results)
 
     # ---- 导出率失真曲线数据 ----
-    rd_file = f"{args.output_root}/{args.scene}/rd_curve_data_{args.split_mode}.json"
-    os.makedirs(os.path.dirname(rd_file), exist_ok=True)
+    plot_dir = f"{args.output_root}/{args.scene}/ablation_plots"
+    os.makedirs(plot_dir, exist_ok=True)
+    rd_file = os.path.join(plot_dir, f"rd_curve_data_{args.split_mode}.json")
     export_rd_curve_data(all_results, rd_file)
 
-    # ---- 生成绘图建议 ----
+    # ---- 生成消融对比图 ----
     print("\n" + "=" * 80)
-    print("  绘图建议 (用 matplotlib 或其他工具)")
+    print("  生成消融对比图表...")
     print("=" * 80)
-    print(f"""
-  1. 率失真曲线 (最核心):
-     X轴: Model Size (MB)  |  Y轴: PSNR (dB)
-     每个实验是一个点, Scaffold-GS 是水平参考线
-     数据文件: {rd_file}
+    plot_ablation_comparison(all_results, plot_dir, args.scene)
 
-  2. 压缩比柱状图:
-     X轴: 方法名  |  Y轴: 压缩比 (相对 Scaffold-GS)
+    # ---- 输出消融实验结论 ----
+    print_ablation_conclusion(all_results, args.scene, plot_dir)
 
-  3. 质量对比渲染图:
-     同一视角的 GT / Scaffold-GS / HAC++ 渲染结果 + error map
-     图片目录: {{model_path}}/test/ours_30000/renders/
-
-  4. 收敛曲线 (如果使用了 tensorboard):
-     X轴: iteration  |  Y轴: training loss
-""")
+    # ---- 汇总提示 ----
+    print("\n" + "=" * 80)
+    print(f"  所有结果已保存到: {plot_dir}/")
+    print("  包含:")
+    print(f"    - ablation_psnr_ssim.png/pdf    PSNR+SSIM 对比柱状图")
+    print(f"    - ablation_size.png/pdf          模型大小对比 + 压缩比")
+    print(f"    - ablation_rd_curve.png/pdf      率失真散点图")
+    print(f"    - ablation_summary_table.png/pdf 汇总表格")
+    print(f"    - ablation_conclusion.txt        消融结论")
+    print(f"    - {os.path.basename(rd_file)}  原始数据 (JSON)")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
