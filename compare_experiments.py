@@ -26,7 +26,39 @@ from collections import OrderedDict
 #  配置: 需要运行的实验列表
 # ====================================================================
 
-def get_experiments(scene_name, data_root, output_root="outputs"):
+def build_split_configs(split_mode, llffhold_values, lod_values):
+    """构建可枚举的数据划分配置。"""
+    split_cfgs = []
+    if split_mode == "llffhold":
+        vals = llffhold_values if llffhold_values else [8]
+        for v in vals:
+            tag = f"llffhold{v}"
+            # 保持兼容: 默认单个 llffhold=8 时沿用旧目录结构
+            if len(vals) == 1 and v == 8:
+                tag = ""
+            split_cfgs.append({
+                "tag": tag,
+                "name": f"llffhold={v}",
+                "extra_args": ["--llffhold", str(v), "--lod", "0"],
+            })
+    elif split_mode == "lod":
+        vals = lod_values if lod_values else [0]
+        for v in vals:
+            tag = f"lod{v}"
+            # 保持兼容: 默认单个 lod=0 时沿用旧目录结构
+            if len(vals) == 1 and v == 0:
+                tag = ""
+            split_cfgs.append({
+                "tag": tag,
+                "name": f"lod={v}",
+                "extra_args": ["--lod", str(v)],
+            })
+    else:
+        raise ValueError(f"Unsupported split_mode: {split_mode}")
+    return split_cfgs
+
+
+def get_experiments(scene_name, data_root, output_root="outputs", split_cfgs=None, lambda_rates=None):
     """
     定义所有需要运行和对比的实验配置。
 
@@ -39,7 +71,6 @@ def get_experiments(scene_name, data_root, output_root="outputs"):
     base_args = [
         "--eval",
         "-s", data_path,
-        "--lod", "0",
         "--voxel_size", "0.001",
         "--update_init_factor", "16",
         "--appearance_dim", "0",
@@ -48,33 +79,40 @@ def get_experiments(scene_name, data_root, output_root="outputs"):
     ]
 
     experiments = []
+    split_cfgs = split_cfgs if split_cfgs is not None else [dict(tag="", name="llffhold=8", extra_args=["--llffhold", "8", "--lod", "0"])]
+    lambda_rates = lambda_rates if lambda_rates is not None else [0.0, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3]
 
-    # ---- 1. 原版 Scaffold-GS (基线) ----
-    scaffold_path = f"{output_root}/{scene_name}/scaffold_gs"
-    experiments.append({
-        "name": "Scaffold-GS (Baseline)",
-        "model_path": scaffold_path,
-        "cmd": ["python", "train.py"] + base_args + [
-            "-m", scaffold_path,
-            "--port", "12340",
-        ],
-    })
+    for split in split_cfgs:
+        split_prefix = f"{output_root}/{scene_name}"
+        if split["tag"]:
+            split_prefix = f"{split_prefix}/{split['tag']}"
+        split_name = f"[{split['name']}] "
 
-    # ---- 2. HAC++ 不同 lambda_rate (率失真曲线) ----
-    lambda_rates = [0.0, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3]
-    for lr in lambda_rates:
-        lr_str = f"{lr:.0e}" if lr > 0 else "0"
-        hac_path = f"{output_root}/{scene_name}/hac_lr{lr_str}"
+        # ---- 1. 原版 Scaffold-GS (基线) ----
+        scaffold_path = f"{split_prefix}/scaffold_gs"
         experiments.append({
-            "name": f"HAC++ (λ_rate={lr_str})",
-            "model_path": hac_path,
-            "cmd": ["python", "train.py"] + base_args + [
-                "-m", hac_path,
-                "--port", "12341",
-                "--use_hash_grid",
-                "--lambda_rate", str(lr),
+            "name": f"{split_name}Scaffold-GS (Baseline)",
+            "model_path": scaffold_path,
+            "cmd": ["python", "train.py"] + base_args + split["extra_args"] + [
+                "-m", scaffold_path,
+                "--port", "12340",
             ],
         })
+
+        # ---- 2. HAC++ 不同 lambda_rate (率失真曲线) ----
+        for lr in lambda_rates:
+            lr_str = f"{lr:.0e}" if lr > 0 else "0"
+            hac_path = f"{split_prefix}/hac_lr{lr_str}"
+            experiments.append({
+                "name": f"{split_name}HAC++ (λ_rate={lr_str})",
+                "model_path": hac_path,
+                "cmd": ["python", "train.py"] + base_args + split["extra_args"] + [
+                    "-m", hac_path,
+                    "--port", "12341",
+                    "--use_hash_grid",
+                    "--lambda_rate", str(lr),
+                ],
+            })
 
     return experiments
 
@@ -275,11 +313,27 @@ def main():
     parser.add_argument("--data_root", type=str, default="data/mipnerf360", help="数据集根目录")
     parser.add_argument("--output_root", type=str, default="outputs", help="实验输出根目录")
     parser.add_argument("--gpu", type=str, default="0", help="GPU 编号")
+    parser.add_argument("--split_mode", type=str, default="llffhold", choices=["llffhold", "lod"],
+                        help="数据划分模式: llffhold 或 lod")
+    parser.add_argument("--llffhold_values", nargs="+", type=int, default=[8],
+                        help="当 split_mode=llffhold 时使用, 可传多个值做消融")
+    parser.add_argument("--lod_values", nargs="+", type=int, default=[0],
+                        help="当 split_mode=lod 时使用, 可传多个值做消融")
+    parser.add_argument("--lambda_rates", nargs="+", type=float,
+                        default=[0.0, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3],
+                        help="HAC++ lambda_rate 列表")
     parser.add_argument("--collect_only", action="store_true", help="仅收集已有结果,不重新训练")
     parser.add_argument("--skip_baseline", action="store_true", help="跳过 Scaffold-GS 基线训练")
     args = parser.parse_args()
 
-    experiments = get_experiments(args.scene, args.data_root, args.output_root)
+    split_cfgs = build_split_configs(args.split_mode, args.llffhold_values, args.lod_values)
+    experiments = get_experiments(
+        args.scene,
+        args.data_root,
+        args.output_root,
+        split_cfgs=split_cfgs,
+        lambda_rates=args.lambda_rates,
+    )
 
     # ---- 运行实验 ----
     if not args.collect_only:
@@ -326,7 +380,7 @@ def main():
     print_comparison_table(all_results)
 
     # ---- 导出率失真曲线数据 ----
-    rd_file = f"{args.output_root}/{args.scene}/rd_curve_data.json"
+    rd_file = f"{args.output_root}/{args.scene}/rd_curve_data_{args.split_mode}.json"
     os.makedirs(os.path.dirname(rd_file), exist_ok=True)
     export_rd_curve_data(all_results, rd_file)
 

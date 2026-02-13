@@ -63,6 +63,7 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.lod = 0
+        self.llffhold = 8
 
         self.appearance_dim = 32
         self.lowpoly = False
