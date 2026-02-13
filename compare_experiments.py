@@ -209,19 +209,18 @@ def collect_results(model_path: str) -> dict:
     result = {'psnr': None, 'ssim': None, 'lpips': None, 'fps': None}
 
     # 读取 results.json
+    # train.py evaluate() 写出的格式: { "ours_30000": { "PSNR": xx, "SSIM": xx, "LPIPS": xx } }
     results_file = Path(model_path) / "results.json"
     if results_file.exists():
         with open(results_file) as f:
             data = json.load(f)
-        # results.json 的结构: { model_path: { method: { PSNR, SSIM, LPIPS } } }
-        for scene_key in data:
-            for method_key in data[scene_key]:
-                metrics = data[scene_key][method_key]
+        for method_key in data:
+            metrics = data[method_key]
+            if isinstance(metrics, dict):
                 result['psnr'] = metrics.get('PSNR')
                 result['ssim'] = metrics.get('SSIM')
                 result['lpips'] = metrics.get('LPIPS')
                 break
-            break
 
     # 读取输出日志获取 FPS
     log_file = Path(model_path) / "outputs.log"

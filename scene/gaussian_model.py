@@ -225,7 +225,10 @@ class GaussianModel:
         # ---- HAC++ compression components ----
         # hac_mode: 0 = off, 1 = base Q0 noise, 2 = full HAC++
         self.hac_mode = 0
-        self.hash_grid = None
+        # hash_grid 和 context_model 仅在未使用 hash_grid 时初始化为 None
+        # (使用 hash_grid 时, 在上面的 if self.use_hash_grid 分支中已创建)
+        if not self.use_hash_grid:
+            self.hash_grid = None
         self.context_model = None
 
 
