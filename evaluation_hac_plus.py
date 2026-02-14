@@ -4,7 +4,11 @@ evaluation_hac_plus.py
 ======================
 Comprehensive comparison and evaluation of HAC++ vs Scaffold-GS baseline.
 
-Based on: "HAC++: Towards 100X Compression of 3D Gaussian Splatting"
+Adapted for the EXP_HAC architecture which uses:
+  - encoding_xyz (MultiResolutionHashGrid) for hash grid context
+  - mlp_grid + mlp_deform for entropy parameter prediction
+  - _mask learnable per-offset masks
+  - Direct attribute storage (NOT hash-grid-decoded for rendering)
 
 Modules
 -------
@@ -17,10 +21,10 @@ Modules
 Usage
 -----
     python evaluation_hac_plus.py \
-        --source_path /path/to/dataset \
-        --scaffold_model output/scaffold_gs \
-        --hac_models output/hac_l0005 output/hac_l001 output/hac_l002 output/hac_l004 \
-        --hac_lambdas 0.0005 0.001 0.002 0.004 \
+        --source_path data/mipnerf360/flowers \
+        --scaffold_model outputs/flowers/scaffold_gs \
+        --hac_models outputs/flowers/hac_lmbda5e-04 outputs/flowers/hac_lmbda1e-03 \
+        --hac_lambdas 0.0005 0.001 \
         --output_dir evaluation_results
 """
 
@@ -42,12 +46,12 @@ import seaborn as sns
 
 import lpips as lpips_lib
 
-# ---- project imports (run from repo root) ----
+# ---- project imports (run from EXP_HAC repo root) ----
 from scene import Scene, GaussianModel
-from scene.hac_model import BinaryHashGrid, HACContextModel
 from gaussian_renderer import prefilter_voxel, render
 from utils.image_utils import psnr
 from utils.loss_utils import ssim
+from utils.encodings import STE_binary, STE_multistep, get_binary_vxl_size
 
 # ================================================================
 #  Global State & Style
@@ -61,6 +65,11 @@ plt.rcParams.update({
     "axes.titlesize":   14,
     "axes.labelsize":   12,
 })
+
+# HAC++ quantization base step sizes (hardcoded, matching renderer)
+Q0_FEAT = 1.0
+Q0_SCALING = 0.001
+Q0_OFFSET = 0.2
 
 _LPIPS_FN = None
 
@@ -77,7 +86,7 @@ def _get_lpips_fn():
 def parse_args():
     p = ArgumentParser(description="HAC++ Comprehensive Evaluation")
     p.add_argument("--source_path",     type=str, required=True,
-                   help="Path to the dataset (e.g. data/nerf_synthetic/lego)")
+                   help="Path to the dataset (e.g. data/mipnerf360/flowers)")
     p.add_argument("--scaffold_model",  type=str, required=True,
                    help="Path to the trained Scaffold-GS output directory")
     p.add_argument("--hac_models",      nargs="+", type=str, required=True,
@@ -93,15 +102,21 @@ def parse_args():
                    help="Views for mask analysis (0 = all test views)")
     p.add_argument("--batch_size",      type=int, default=4096,
                    help="Batch size for batched entropy / quant-step computation")
+    # Hash grid params (must match training)
+    p.add_argument("--log2",            type=int, default=13,
+                   help="log2 hashmap size for 3D hash grid")
+    p.add_argument("--n_features",      type=int, default=4,
+                   help="Features per hash level")
     return p.parse_args()
 
 
 # ================================================================
 #  Model Loading
 # ================================================================
-def load_model(model_path: str, source_path: str, iteration: int = -1):
+def load_model(model_path: str, source_path: str, iteration: int = -1,
+               n_features: int = 4, log2: int = 13):
     """
-    Load a trained Scaffold-GS or HAC++ model.
+    Load a trained EXP_HAC model (Scaffold-GS baseline or HAC++).
 
     Returns
     -------
@@ -120,36 +135,35 @@ def load_model(model_path: str, source_path: str, iteration: int = -1):
 
     # ensure all expected keys exist with safe defaults
     _defaults = dict(
-        feat_dim=32, n_offsets=10, voxel_size=0.001,
+        feat_dim=50, n_offsets=10, voxel_size=0.001,
         update_depth=3, update_init_factor=16, update_hierachy_factor=4,
-        use_feat_bank=False, appearance_dim=32, ratio=1,
-        add_opacity_dist=False, add_cov_dist=False, add_color_dist=False,
-        white_background=False, eval=False, data_device="cuda",
+        use_feat_bank=False,
+        white_background=False, eval=True, data_device="cuda",
         images="images", resolution=-1, sh_degree=3,
+        lod=0, llffhold=8,
     )
     for k, v in _defaults.items():
         if not hasattr(cfg, k):
             setattr(cfg, k, v)
 
+    # Detect synthetic NeRF datasets
+    is_synthetic_nerf = os.path.exists(
+        os.path.join(os.path.abspath(source_path), "transforms_train.json"))
+
     # ---- build & load ----
     gaussians = GaussianModel(
         cfg.feat_dim, cfg.n_offsets, cfg.voxel_size,
         cfg.update_depth, cfg.update_init_factor, cfg.update_hierachy_factor,
-        cfg.use_feat_bank, cfg.appearance_dim, cfg.ratio,
-        cfg.add_opacity_dist, cfg.add_cov_dist, cfg.add_color_dist,
+        cfg.use_feat_bank,
+        hash_n_features_per_level=n_features,
+        hash_log2_hashmap_size=log2,
+        decoded_version=True,
+        is_synthetic_nerf=is_synthetic_nerf,
     )
     scene = Scene(cfg, gaussians, load_iteration=iteration, shuffle=False)
 
-    # auto-detect HAC++ checkpoint
-    ckpt_dir  = os.path.join(model_path,
-                             f"point_cloud/iteration_{scene.loaded_iter}")
-    ckpt_file = os.path.join(ckpt_dir, "hac_checkpoints.pth")
-    if os.path.exists(ckpt_file):
-        gaussians.load_hac_checkpoints(ckpt_dir)
-        print(f"    [HAC++] Loaded compression model  "
-              f"(mode={gaussians.hac_mode})")
-
     gaussians.eval()
+    gaussians.update_anchor_bound()
     return gaussians, scene, cfg
 
 
@@ -205,7 +219,7 @@ def _count_module_bytes(module, dtype_bytes=4):
 
 def compute_storage_scaffold(gaussians):
     """
-    Analytical storage for raw Scaffold-GS (all float32).
+    Analytical storage for a Scaffold-GS / HAC++ model (all float32, no compression).
     """
     N    = gaussians.get_anchor.shape[0]
     fd   = gaussians._anchor_feat.shape[1]
@@ -220,17 +234,24 @@ def compute_storage_scaffold(gaussians):
         Locations = N * 3 * 4,
         Rotation  = N * rd * 4,
         Opacity   = N * 1 * 4,
+        Masks     = N * (noff + 1) * 1 * 4,
     )
-    # MLPs
+
+    # MLPs (rendering)
     mlp_bytes = 0
     mlp_bytes += _count_module_bytes(gaussians.mlp_opacity)
     mlp_bytes += _count_module_bytes(gaussians.mlp_cov)
     mlp_bytes += _count_module_bytes(gaussians.mlp_color)
     if gaussians.use_feat_bank:
         mlp_bytes += _count_module_bytes(gaussians.mlp_feature_bank)
-    if gaussians.appearance_dim > 0 and gaussians.embedding_appearance is not None:
-        mlp_bytes += _count_module_bytes(gaussians.embedding_appearance)
     b["Networks"] = mlp_bytes
+
+    # Hash grid encoding + entropy MLPs (overhead)
+    ctx_bytes = 0
+    ctx_bytes += _count_module_bytes(gaussians.encoding_xyz)
+    ctx_bytes += _count_module_bytes(gaussians.mlp_grid)
+    ctx_bytes += _count_module_bytes(gaussians.mlp_deform)
+    b["HashGrid+Context"] = ctx_bytes
 
     total = sum(b.values())
     return dict(
@@ -247,10 +268,7 @@ def compute_storage_hac(gaussians, anchor_mask=None, batch_size=4096):
     """
     Entropy-estimated compressed storage for an HAC++ model.
 
-    Parameters
-    ----------
-    anchor_mask : np.ndarray[bool] of shape [N], optional
-        If given, only count entropy bits for valid anchors.
+    Mirrors the entropy estimation logic in the renderer (phase 3, step > 10000).
     """
     N = gaussians.get_anchor.shape[0]
 
@@ -270,43 +288,89 @@ def compute_storage_hac(gaussians, anchor_mask=None, batch_size=4096):
                       desc="    Entropy estimation", leave=False):
         end = min(start + batch_size, N_valid)
         idx = valid_idx[start:end]
-        bf, bs, bo, _, _, _ = gaussians.compute_entropy_loss(idx)
-        total_bits_f += bf.sum().item()
-        total_bits_s += bs.sum().item()
-        total_bits_o += bo.sum().item()
+
+        anchor_pos = gaussians.get_anchor[idx]
+        feat = gaussians._anchor_feat[idx]
+        grid_scaling = gaussians.get_scaling[idx]
+        grid_offsets = gaussians._offset[idx]
+        mask_anchor = gaussians.get_mask_anchor[idx]
+
+        # Hash grid context
+        feat_context_orig = gaussians.calc_interp_feat(anchor_pos)
+        feat_context = gaussians.get_grid_mlp(feat_context_orig)
+        mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+            Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
+            torch.split(feat_context, split_size_or_sections=[
+                gaussians.feat_dim, gaussians.feat_dim, gaussians.feat_dim,
+                6, 6,
+                3 * gaussians.n_offsets, 3 * gaussians.n_offsets,
+                1, 1, 1
+            ], dim=-1)
+
+        # Adaptive quantization steps
+        Q_feat_e = Q0_FEAT
+        Q_scaling_e = Q0_SCALING
+        Q_offsets_e = Q0_OFFSET
+        Q_feat_adj_r = Q_feat_adj.contiguous().repeat(1, mean.shape[-1])
+        Q_scaling_adj_r = Q_scaling_adj.contiguous().repeat(1, mean_scaling.shape[-1])
+        Q_offsets_adj_r = Q_offsets_adj.contiguous().repeat(1, mean_offsets.shape[-1])
+        Q_feat_e = Q_feat_e * (1 + torch.tanh(Q_feat_adj_r))
+        Q_scaling_e = Q_scaling_e * (1 + torch.tanh(Q_scaling_adj_r))
+        Q_offsets_e = Q_offsets_e * (1 + torch.tanh(Q_offsets_adj_r)).view(-1, gaussians.n_offsets, 3)
+
+        # Quantize for entropy estimation (STE round)
+        feat_q = STE_multistep.apply(feat, Q_feat_e, gaussians._anchor_feat.mean())
+        grid_scaling_q = STE_multistep.apply(grid_scaling, Q_scaling_e, gaussians.get_scaling.mean())
+        grid_offsets_q = STE_multistep.apply(grid_offsets, Q_offsets_e, gaussians._offset.mean())
+
+        # Intra-anchor context (channel-wise autoregressive)
+        mean_adj, scale_adj, prob_adj = gaussians.get_deform_mlp.forward(
+            feat_q, torch.cat([mean, scale, prob], dim=-1))
+        probs = torch.stack([prob, prob_adj], dim=-1)
+        probs = torch.softmax(probs, dim=-1)
+
+        # Feature entropy (2-component GMM)
+        bit_feat = gaussians.EG_mix_prob_2.forward(
+            feat_q, mean, mean_adj, scale, scale_adj,
+            probs[..., 0], probs[..., 1],
+            Q=Q_feat_e, x_mean=gaussians._anchor_feat.mean())
+        bit_feat = bit_feat * mask_anchor
+
+        # Scaling entropy (single Gaussian)
+        bit_scaling = gaussians.entropy_gaussian.forward(
+            grid_scaling_q, mean_scaling, scale_scaling,
+            Q_scaling_e, gaussians.get_scaling.mean())
+        bit_scaling = bit_scaling * mask_anchor
+
+        # Offsets entropy (single Gaussian)
+        grid_offsets_flat = grid_offsets_q.view(-1, 3 * gaussians.n_offsets)
+        binary_grid_masks = gaussians.get_mask[idx]
+        binary_grid_masks_flat = binary_grid_masks.repeat(1, 1, 3).view(-1, 3 * gaussians.n_offsets)
+        bit_offsets = gaussians.entropy_gaussian.forward(
+            grid_offsets_flat, mean_offsets, scale_offsets,
+            Q_offsets_e.view(-1, 3 * gaussians.n_offsets), gaussians._offset.mean())
+        bit_offsets = bit_offsets * mask_anchor * binary_grid_masks_flat
+
+        total_bits_f += bit_feat.sum().item()
+        total_bits_s += bit_scaling.sum().item()
+        total_bits_o += bit_offsets.sum().item()
 
     bytes_feat    = total_bits_f / 8
     bytes_scaling = total_bits_s / 8
     bytes_offsets = total_bits_o / 8
 
     # ---- 2. Hash Grid – binary entropy from +/-1 symbol frequency ----
-    hash_bits = 0.0
-    tables = [lv.hash_table for lv in gaussians.hash_grid.levels_3d]
-    for lv in gaussians.hash_grid.levels_2d:
-        tables.extend([lv.table_xy, lv.table_xz, lv.table_yz])
-    for t in tables:
-        # Estimate coding rate by the empirical symbol distribution after
-        # binarization: +1 if t>=0 else -1.
-        sym = (t >= 0).float()
-        p_plus = sym.mean().item()
-        p_minus = 1.0 - p_plus
-        eps = 1e-10
-        h = 0.0
-        if p_plus > 0:
-            h -= p_plus * np.log2(p_plus + eps)
-        if p_minus > 0:
-            h -= p_minus * np.log2(p_minus + eps)
-        hash_bits += h * t.numel()
-    bytes_hash = hash_bits / 8
+    binary_params = (gaussians.get_encoding_params() + 1) / 2  # map {-1,+1} to {0,1}
+    _, hash_bits, hash_MB, _ = get_binary_vxl_size(binary_params)
+    bytes_hash = hash_bits.item() / 8 if isinstance(hash_bits, torch.Tensor) else hash_bits / 8
 
-    # ---- 3. Anchor locations (quantized estimate, GPCC-like proxy) ----
-    # Use 16-bit quantized xyz as a simple geometry coding proxy.
-    bytes_loc = N_valid * 3 * 2
+    # ---- 3. Anchor locations (quantized estimate) ----
+    bytes_loc = N_valid * 3 * 2  # 16-bit quantized xyz
 
     # ---- 4. Binary masks (anchor-level + offset-level) ----
-    # Anchor mask: 1 bit / anchor. Offset mask: 1 bit / offset.
-    # Use conservative raw bit count as binary-compressed estimate.
-    bytes_masks = (N + N * gaussians.n_offsets) / 8.0
+    mask_data = gaussians.get_mask.view(-1)
+    _, mask_bits, _, _ = get_binary_vxl_size(mask_data.float())
+    bytes_masks = mask_bits.item() / 8 if isinstance(mask_bits, torch.Tensor) else mask_bits / 8
 
     # ---- 5. Rotation + Opacity (float16, not entropy-coded) ----
     rd = gaussians._rotation.shape[1]
@@ -319,11 +383,11 @@ def compute_storage_hac(gaussians, anchor_mask=None, batch_size=4096):
     mlp_bytes += _count_module_bytes(gaussians.mlp_color)
     if gaussians.use_feat_bank:
         mlp_bytes += _count_module_bytes(gaussians.mlp_feature_bank)
-    if gaussians.appearance_dim > 0 and gaussians.embedding_appearance is not None:
-        mlp_bytes += _count_module_bytes(gaussians.embedding_appearance)
 
     # ---- 7. Context model (decoding overhead, float32) ----
-    ctx_bytes = _count_module_bytes(gaussians.context_model)
+    ctx_bytes = 0
+    ctx_bytes += _count_module_bytes(gaussians.mlp_grid)
+    ctx_bytes += _count_module_bytes(gaussians.mlp_deform)
 
     breakdown = dict(
         Features        = bytes_feat,
@@ -356,10 +420,7 @@ def compute_storage_hac(gaussians, anchor_mask=None, batch_size=4096):
 @torch.no_grad()
 def compute_mask_stats(gaussians, scene, white_bg=False, num_views=0):
     """
-    Aggregate neural-opacity statistics across test views.
-
-    Returns valid-anchor / valid-Gaussian ratios and the raw opacity
-    distribution (for histogram plotting).
+    Aggregate neural-opacity and binary mask statistics across test views.
     """
     bg   = torch.tensor([1, 1, 1] if white_bg else [0, 0, 0],
                         dtype=torch.float32, device="cuda")
@@ -374,44 +435,34 @@ def compute_mask_stats(gaussians, scene, white_bg=False, num_views=0):
 
     # per-anchor / per-offset maximum opacity observed across views
     max_op = torch.full((N, noff), -999.0, device="cuda")
-    all_op = []                                # for histogram
+    all_op = []
 
     for view in tqdm(cams, desc="    Mask analysis", leave=False):
         vis_mask = prefilter_voxel(view, gaussians, pipe, bg)
         vis_idx  = torch.where(vis_mask)[0]
 
         anchor = gaussians.get_anchor[vis_mask]
-        feat, grid_scaling, grid_offsets = \
-            gaussians.get_quantized_attributes(vis_mask)
+        feat = gaussians._anchor_feat[vis_mask]
+        binary_grid_masks = gaussians.get_mask[vis_mask]  # [V, noff, 1]
 
         # view direction & distance
         ob_view = anchor - view.camera_center
         ob_dist = ob_view.norm(dim=1, keepdim=True)
         ob_view = ob_view / ob_dist
 
-        # feature-bank (if enabled)
-        if gaussians.use_feat_bank:
-            cat_vd = torch.cat([ob_view, ob_dist], dim=1)
-            bw = gaussians.get_featurebank_mlp(cat_vd).unsqueeze(1)
-            fb = feat.unsqueeze(-1)
-            feat = (fb[:, ::4, :1].repeat(1, 4, 1) * bw[:, :, :1]
-                    + fb[:, ::2, :1].repeat(1, 2, 1) * bw[:, :, 1:2]
-                    + fb[:, ::1, :1] * bw[:, :, 2:]).squeeze(-1)
+        # MLP input (always includes distance in EXP_HAC)
+        cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1)
+        neural_op = gaussians.get_opacity_mlp(cat_local_view)  # [V, noff]
 
-        # neural opacity  (same logic as renderer)
-        if gaussians.add_opacity_dist:
-            cat_in = torch.cat([feat, ob_view, ob_dist], dim=1)
-        else:
-            cat_in = torch.cat([feat, ob_view], dim=1)
-
-        neural_op = gaussians.get_opacity_mlp(cat_in)          # [V, noff]
+        # Apply binary mask
+        neural_op = neural_op * binary_grid_masks.squeeze(-1)
 
         max_op[vis_idx] = torch.max(max_op[vis_idx], neural_op)
         all_op.append(neural_op.cpu().flatten())
 
     # ---- aggregate ----
     was_visible = (max_op > -998.0).any(dim=1)
-    anchor_valid  = (max_op > 0.0).any(dim=1)          # at least 1 active offset
+    anchor_valid  = (max_op > 0.0).any(dim=1)
     offset_valid  = (max_op > 0.0)
 
     va = anchor_valid[was_visible].float().mean().item() if was_visible.any() else 0.0
@@ -434,26 +485,72 @@ def compute_mask_stats(gaussians, scene, white_bg=False, num_views=0):
 @torch.no_grad()
 def compute_bit_allocation(gaussians, batch_size=4096):
     """Return per-anchor bit consumption and anchor xyz positions."""
-    if gaussians.hac_mode < 2 or gaussians.hash_grid is None:
-        return None
-
     N = gaussians.get_anchor.shape[0]
-    bits = torch.zeros(N, 3, device="cuda")        # feat / scaling / offset
+    bits = torch.zeros(N, 3, device="cuda")  # feat / scaling / offset
 
     for start in tqdm(range(0, N, batch_size),
                       desc="    Bit allocation", leave=False):
         end = min(start + batch_size, N)
         idx = torch.arange(start, end, device="cuda")
-        bf, bs, bo, _, _, _ = gaussians.compute_entropy_loss(idx)
-        bits[start:end, 0] = bf
-        bits[start:end, 1] = bs
-        bits[start:end, 2] = bo
+
+        anchor_pos = gaussians.get_anchor[idx]
+        feat = gaussians._anchor_feat[idx]
+        grid_scaling = gaussians.get_scaling[idx]
+        grid_offsets = gaussians._offset[idx]
+        mask_anchor = gaussians.get_mask_anchor[idx]
+
+        # Hash grid context
+        feat_context_orig = gaussians.calc_interp_feat(anchor_pos)
+        feat_context = gaussians.get_grid_mlp(feat_context_orig)
+        mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+            Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
+            torch.split(feat_context, split_size_or_sections=[
+                gaussians.feat_dim, gaussians.feat_dim, gaussians.feat_dim,
+                6, 6,
+                3 * gaussians.n_offsets, 3 * gaussians.n_offsets,
+                1, 1, 1
+            ], dim=-1)
+
+        Q_feat_adj_r = Q_feat_adj.contiguous().repeat(1, mean.shape[-1])
+        Q_scaling_adj_r = Q_scaling_adj.contiguous().repeat(1, mean_scaling.shape[-1])
+        Q_offsets_adj_r = Q_offsets_adj.contiguous().repeat(1, mean_offsets.shape[-1])
+        Q_feat_e = Q0_FEAT * (1 + torch.tanh(Q_feat_adj_r))
+        Q_scaling_e = Q0_SCALING * (1 + torch.tanh(Q_scaling_adj_r))
+        Q_offsets_e = Q0_OFFSET * (1 + torch.tanh(Q_offsets_adj_r)).view(-1, gaussians.n_offsets, 3)
+
+        feat_q = STE_multistep.apply(feat, Q_feat_e, gaussians._anchor_feat.mean())
+        grid_scaling_q = STE_multistep.apply(grid_scaling, Q_scaling_e, gaussians.get_scaling.mean())
+        grid_offsets_q = STE_multistep.apply(grid_offsets, Q_offsets_e, gaussians._offset.mean())
+
+        mean_adj, scale_adj, prob_adj = gaussians.get_deform_mlp.forward(
+            feat_q, torch.cat([mean, scale, prob], dim=-1))
+        probs = torch.stack([prob, prob_adj], dim=-1)
+        probs = torch.softmax(probs, dim=-1)
+
+        bit_feat = gaussians.EG_mix_prob_2.forward(
+            feat_q, mean, mean_adj, scale, scale_adj,
+            probs[..., 0], probs[..., 1],
+            Q=Q_feat_e, x_mean=gaussians._anchor_feat.mean())
+
+        bit_scaling = gaussians.entropy_gaussian.forward(
+            grid_scaling_q, mean_scaling, scale_scaling,
+            Q_scaling_e, gaussians.get_scaling.mean())
+
+        grid_offsets_flat = grid_offsets_q.view(-1, 3 * gaussians.n_offsets)
+        bit_offsets = gaussians.entropy_gaussian.forward(
+            grid_offsets_flat, mean_offsets, scale_offsets,
+            Q_offsets_e.view(-1, 3 * gaussians.n_offsets), gaussians._offset.mean())
+
+        # Per-anchor total bits (sum across dimensions, masked)
+        bits[start:end, 0] = (bit_feat * mask_anchor).sum(dim=1)
+        bits[start:end, 1] = (bit_scaling * mask_anchor).sum(dim=1)
+        bits[start:end, 2] = (bit_offsets * mask_anchor).sum(dim=1)
 
     pos   = gaussians.get_anchor.detach().cpu().numpy()
     total = bits.sum(dim=1).cpu().numpy()
     return dict(
-        positions=pos,                            # [N, 3]
-        total_bits=total,                         # [N]
+        positions=pos,
+        total_bits=total,
         bits_feat=bits[:, 0].cpu().numpy(),
         bits_scaling=bits[:, 1].cpu().numpy(),
         bits_offset=bits[:, 2].cpu().numpy(),
@@ -465,27 +562,38 @@ def compute_bit_allocation(gaussians, batch_size=4096):
 # ================================================================
 @torch.no_grad()
 def compute_quantization_steps(gaussians, batch_size=8192):
-    """Extract the learned quantization step sizes q_i from the AQM."""
-    if gaussians.hac_mode < 2 or gaussians.context_model is None:
-        return None
-
+    """Extract the learned quantization step sizes q_i from mlp_grid."""
     N = gaussians.get_anchor.shape[0]
     q_f_all, q_s_all, q_o_all = [], [], []
 
     for start in tqdm(range(0, N, batch_size),
                       desc="    Quant steps", leave=False):
         end = min(start + batch_size, N)
-        pos = gaussians.get_anchor[start:end]
-        hf  = gaussians.hash_grid(pos)
-        qf, qs, qo = gaussians.context_model.compute_quantization_step(hf)
-        q_f_all.append(qf.cpu())
-        q_s_all.append(qs.cpu())
-        q_o_all.append(qo.cpu())
+        anchor_pos = gaussians.get_anchor[start:end]
+
+        feat_context_orig = gaussians.calc_interp_feat(anchor_pos)
+        feat_context = gaussians.get_grid_mlp(feat_context_orig)
+        _, _, _, _, _, _, _, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
+            torch.split(feat_context, split_size_or_sections=[
+                gaussians.feat_dim, gaussians.feat_dim, gaussians.feat_dim,
+                6, 6,
+                3 * gaussians.n_offsets, 3 * gaussians.n_offsets,
+                1, 1, 1
+            ], dim=-1)
+
+        # Compute actual step sizes: Q0 * (1 + tanh(r))
+        q_f = Q0_FEAT * (1 + torch.tanh(Q_feat_adj))        # [B, 1]
+        q_s = Q0_SCALING * (1 + torch.tanh(Q_scaling_adj))    # [B, 1]
+        q_o = Q0_OFFSET * (1 + torch.tanh(Q_offsets_adj))     # [B, 1]
+
+        q_f_all.append(q_f.cpu())
+        q_s_all.append(q_s.cpu())
+        q_o_all.append(q_o.cpu())
 
     return dict(
-        q_feat=torch.cat(q_f_all).numpy(),        # [N, feat_dim]
-        q_scaling=torch.cat(q_s_all).numpy(),      # [N, scaling_dim]
-        q_offset=torch.cat(q_o_all).numpy(),       # [N, offset_dim]
+        q_feat=torch.cat(q_f_all).numpy(),
+        q_scaling=torch.cat(q_s_all).numpy(),
+        q_offset=torch.cat(q_o_all).numpy(),
     )
 
 
@@ -506,7 +614,7 @@ def plot_rate_distortion(results, output_dir):
                 textcoords="offset points", xytext=(12, 8),
                 fontsize=10, fontweight="bold", color="red")
 
-    # HAC++ models (sorted by lambda → typically decreasing size)
+    # HAC++ models
     hac_keys = sorted(k for k in results if k.startswith("hac_"))
     sizes, psnrs, labels = [], [], []
     for k in hac_keys:
@@ -515,13 +623,14 @@ def plot_rate_distortion(results, output_dir):
         psnrs.append(r["metrics"]["psnr"])
         labels.append(r["label"])
 
-    ax.plot(sizes, psnrs, "o-", color="#1976D2",
-            markersize=10, linewidth=2, label="HAC++", zorder=4)
-    for i, lb in enumerate(labels):
-        ax.annotate(lb.replace("HAC++ ", ""),
-                    (sizes[i], psnrs[i]),
-                    textcoords="offset points", xytext=(8, -14),
-                    fontsize=8, alpha=0.85)
+    if sizes:
+        ax.plot(sizes, psnrs, "o-", color="#1976D2",
+                markersize=10, linewidth=2, label="HAC++", zorder=4)
+        for i, lb in enumerate(labels):
+            ax.annotate(lb.replace("HAC++ ", ""),
+                        (sizes[i], psnrs[i]),
+                        textcoords="offset points", xytext=(8, -14),
+                        fontsize=8, alpha=0.85)
 
     ax.set_xlabel("Model Size (MB)")
     ax.set_ylabel("PSNR (dB)")
@@ -535,22 +644,20 @@ def plot_rate_distortion(results, output_dir):
 #  Plot 2 – Storage Decomposition  (stacked bar)
 # ================================================================
 def plot_storage_decomposition(results, output_dir):
-    # ---- collect per-model component vectors ----
     model_labels = []
     components   = ["Features", "Offsets", "Scaling",
                     "Locations", "HashGrid", "Masks", "Networks"]
     comp_data    = {c: [] for c in components}
 
-    # Scaffold-GS (HashGrid = 0)
+    # Scaffold-GS baseline
     sg_bd = results["scaffold"]["storage"]["breakdown_mb"]
     model_labels.append("Scaffold-GS")
     comp_data["Features"].append(sg_bd.get("Features", 0))
     comp_data["Offsets"].append(sg_bd.get("Offsets", 0))
     comp_data["Scaling"].append(sg_bd.get("Scaling", 0))
     comp_data["Locations"].append(sg_bd.get("Locations", 0))
-    comp_data["HashGrid"].append(0.0)
-    comp_data["Masks"].append(0.0)
-    # group Rotation + Opacity + Networks into "Networks"
+    comp_data["HashGrid"].append(sg_bd.get("HashGrid+Context", 0))
+    comp_data["Masks"].append(sg_bd.get("Masks", 0))
     net = (sg_bd.get("Networks", 0)
            + sg_bd.get("Rotation", 0)
            + sg_bd.get("Opacity", 0))
@@ -597,12 +704,10 @@ def plot_storage_decomposition(results, output_dir):
 def plot_mask_distribution(results, output_dir):
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    # Left: Scaffold-GS
     _plot_opacity_hist(axes[0],
                        results["scaffold"]["mask_stats"],
                        "Scaffold-GS", "#EF5350")
 
-    # Right: HAC++ (pick highest lambda for strongest pruning effect)
     hac_keys = sorted(k for k in results if k.startswith("hac_"))
     if hac_keys:
         hk = hac_keys[-1]
@@ -638,7 +743,6 @@ def _plot_opacity_hist(ax, ms, title, color):
 #  Plot 4 – Bit Allocation 3-D Scatter
 # ================================================================
 def plot_bit_allocation_3d(results, output_dir):
-    # pick first HAC++ model with bit data
     ba, label = None, ""
     mask = None
     for k in sorted(k for k in results if k.startswith("hac_")):
@@ -694,9 +798,9 @@ def plot_quantization_steps(results, output_dir):
 
     fig, axes = plt.subplots(1, 3, figsize=(17, 5))
     _spec = [
-        ("q_feat",    "Feature $q_i$",  HACContextModel.Q0_FEAT,    "#EF5350"),
-        ("q_scaling", "Scaling $q_i$",  HACContextModel.Q0_SCALING, "#42A5F5"),
-        ("q_offset",  "Offset $q_i$",   HACContextModel.Q0_OFFSET,  "#66BB6A"),
+        ("q_feat",    "Feature $q_i$",  Q0_FEAT,    "#EF5350"),
+        ("q_scaling", "Scaling $q_i$",  Q0_SCALING, "#42A5F5"),
+        ("q_offset",  "Offset $q_i$",   Q0_OFFSET,  "#66BB6A"),
     ]
     for ax, (key, title, q0, color) in zip(axes, _spec):
         vals = qs[key].flatten()
@@ -786,7 +890,7 @@ def print_summary(results, output_dir):
               encoding="utf-8") as f:
         f.write(report)
 
-    # save JSON version (serialisable)
+    # save JSON version
     jdata = {}
     for key in all_keys:
         r = results[key]
@@ -803,8 +907,8 @@ def print_summary(results, output_dir):
     with open(os.path.join(output_dir, "results.json"), "w") as f:
         json.dump(jdata, f, indent=2)
 
-    print(f"\n    Report  → {output_dir}/summary_report.txt")
-    print(f"    JSON    → {output_dir}/results.json")
+    print(f"\n    Report  -> {output_dir}/summary_report.txt")
+    print(f"    JSON    -> {output_dir}/results.json")
 
 
 # ================================================================
@@ -826,21 +930,22 @@ def main():
     print(f"{'=' * 60}")
 
     sg_g, sg_s, sg_c = load_model(
-        args.scaffold_model, args.source_path, args.iteration)
+        args.scaffold_model, args.source_path, args.iteration,
+        n_features=args.n_features, log2=args.log2)
     wbg = getattr(sg_c, "white_background", args.white_background)
 
-    print("  [1/3] Test metrics …")
+    print("  [1/3] Test metrics ...")
     sg_metrics = compute_test_metrics(sg_g, sg_s, wbg)
     print(f"        PSNR={sg_metrics['psnr']:.2f}  "
           f"SSIM={sg_metrics['ssim']:.4f}  "
           f"LPIPS={sg_metrics['lpips']:.4f}")
 
-    print("  [2/3] Storage …")
+    print("  [2/3] Storage ...")
     sg_storage = compute_storage_scaffold(sg_g)
     print(f"        {sg_storage['total_mb']:.2f} MB  "
           f"({sg_storage['num_anchors']} anchors)")
 
-    print("  [3/3] Mask analysis …")
+    print("  [3/3] Mask analysis ...")
     sg_mask = compute_mask_stats(sg_g, sg_s, wbg, args.num_mask_views)
     print(f"        Anchor valid: {sg_mask['valid_anchor_ratio']:.1%}  "
           f"Gaussian valid: {sg_mask['valid_gaussian_ratio']:.1%}")
@@ -858,51 +963,44 @@ def main():
     # ═══════════════════════════════════════════════════════════
     for mpath, lam in zip(args.hac_models, args.hac_lambdas):
         key   = f"hac_{lam}"
-        label = f"HAC++ (λ={lam})"
+        label = f"HAC++ (lmbda={lam})"
 
         print(f"\n{'=' * 60}")
         print(f"  Processing: {label}")
         print(f"{'=' * 60}")
 
         try:
-            g, s, c = load_model(mpath, args.source_path, args.iteration)
+            g, s, c = load_model(mpath, args.source_path, args.iteration,
+                                 n_features=args.n_features, log2=args.log2)
         except Exception as e:
             print(f"  [ERROR] Failed to load {mpath}: {e}")
             continue
-        wbg    = getattr(c, "white_background", args.white_background)
-        is_hac = (g.hac_mode >= 2 and g.hash_grid is not None)
+        wbg = getattr(c, "white_background", args.white_background)
 
-        print("  [1/5] Test metrics …")
+        print("  [1/5] Test metrics ...")
         metrics = compute_test_metrics(g, s, wbg)
         print(f"        PSNR={metrics['psnr']:.2f}  "
               f"SSIM={metrics['ssim']:.4f}  "
               f"LPIPS={metrics['lpips']:.4f}")
 
-        print("  [2/5] Mask analysis …")
+        print("  [2/5] Mask analysis ...")
         mask_stats = compute_mask_stats(g, s, wbg, args.num_mask_views)
         print(f"        Anchor valid: {mask_stats['valid_anchor_ratio']:.1%}  "
               f"Gaussian valid: {mask_stats['valid_gaussian_ratio']:.1%}")
 
-        print("  [3/5] Storage …")
-        if is_hac:
-            storage = compute_storage_hac(
-                g, anchor_mask=mask_stats["anchor_mask"],
-                batch_size=args.batch_size)
-        else:
-            print("        [WARN] No HAC++ ckpt – using raw Scaffold-GS size.")
-            storage = compute_storage_scaffold(g)
+        print("  [3/5] Storage (entropy-estimated) ...")
+        storage = compute_storage_hac(
+            g, anchor_mask=mask_stats["anchor_mask"],
+            batch_size=args.batch_size)
         print(f"        {storage['total_mb']:.2f} MB  "
-              f"({storage['num_anchors']} anchors)")
+              f"({storage['num_anchors']} anchors, "
+              f"{storage.get('num_valid_anchors', '?')} valid)")
 
-        bit_alloc, quant_steps = None, None
-        if is_hac:
-            print("  [4/5] Bit allocation …")
-            bit_alloc = compute_bit_allocation(g, args.batch_size)
-            print("  [5/5] Quantization steps …")
-            quant_steps = compute_quantization_steps(g, args.batch_size)
-        else:
-            print("  [4/5] Bit allocation … SKIPPED (no HAC++)")
-            print("  [5/5] Quantization steps … SKIPPED")
+        print("  [4/5] Bit allocation ...")
+        bit_alloc = compute_bit_allocation(g, args.batch_size)
+
+        print("  [5/5] Quantization steps ...")
+        quant_steps = compute_quantization_steps(g, args.batch_size)
 
         results[key] = dict(
             label=label, metrics=metrics, storage=storage,
@@ -919,19 +1017,19 @@ def main():
     print("  Generating plots")
     print(f"{'=' * 60}")
 
-    print("  Plot 1 – Rate-Distortion …")
+    print("  Plot 1 - Rate-Distortion ...")
     plot_rate_distortion(results, args.output_dir)
 
-    print("  Plot 2 – Storage Decomposition …")
+    print("  Plot 2 - Storage Decomposition ...")
     plot_storage_decomposition(results, args.output_dir)
 
-    print("  Plot 3 – Mask Distribution …")
+    print("  Plot 3 - Mask Distribution ...")
     plot_mask_distribution(results, args.output_dir)
 
-    print("  Plot 4 – Bit Allocation 3-D …")
+    print("  Plot 4 - Bit Allocation 3-D ...")
     plot_bit_allocation_3d(results, args.output_dir)
 
-    print("  Plot 5 – Quantization Steps …")
+    print("  Plot 5 - Quantization Steps ...")
     plot_quantization_steps(results, args.output_dir)
 
     # ═══════════════════════════════════════════════════════════
@@ -942,7 +1040,7 @@ def main():
     print(f"{'=' * 60}")
     print_summary(results, args.output_dir)
 
-    print(f"\n  All evaluation complete.  Results → {args.output_dir}/\n")
+    print(f"\n  All evaluation complete.  Results -> {args.output_dir}/\n")
 
 
 if __name__ == "__main__":

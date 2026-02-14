@@ -15,9 +15,9 @@ Scaffold-GS vs HAC++ 消融实验与对比评测脚本
   # 只收集已有结果并生成图表
   python compare_experiments.py --scene flowers --data_root data/mipnerf360 --collect_only
 
-  # 自定义 lambda 做消融
+  # 自定义 lmbda 做消融
   python compare_experiments.py --scene flowers --data_root data/mipnerf360 \\
-      --lambda_rates 1e-4 5e-4 1e-3 --gpu 0
+      --lambda_rates 5e-4 1e-3 2e-3 --gpu 0
 """
 
 import os
@@ -86,8 +86,6 @@ def get_experiments(scene_name, data_root, output_root="outputs", split_cfgs=Non
         "-s", data_path,
         "--voxel_size", str(voxel_size),
         "--update_init_factor", "16",
-        "--appearance_dim", "0",
-        "--ratio", "1",
         "--iterations", "30000",
     ]
     if resolution > 0:
@@ -95,7 +93,7 @@ def get_experiments(scene_name, data_root, output_root="outputs", split_cfgs=Non
 
     experiments = []
     split_cfgs = split_cfgs if split_cfgs is not None else [dict(tag="", name="llffhold=8", extra_args=["--llffhold", "8", "--lod", "0"])]
-    lambda_rates = lambda_rates if lambda_rates is not None else [1e-4, 5e-4, 1e-3]
+    lambda_rates = lambda_rates if lambda_rates is not None else [5e-4, 1e-3, 2e-3]
 
     for split in split_cfgs:
         split_prefix = f"{output_root}/{scene_name}"
@@ -103,7 +101,7 @@ def get_experiments(scene_name, data_root, output_root="outputs", split_cfgs=Non
             split_prefix = f"{split_prefix}/{split['tag']}"
         split_name = f"[{split['name']}] "
 
-        # ---- 1. 原版 Scaffold-GS (基线) ----
+        # ---- 1. 原版 Scaffold-GS (基线, lmbda=0 禁用率失真损失) ----
         scaffold_path = f"{split_prefix}/scaffold_gs"
         experiments.append({
             "name": f"{split_name}Scaffold-GS (Baseline)",
@@ -111,21 +109,21 @@ def get_experiments(scene_name, data_root, output_root="outputs", split_cfgs=Non
             "cmd": ["python", "train.py"] + base_args + split["extra_args"] + [
                 "-m", scaffold_path,
                 "--port", "12340",
+                "--lmbda", "0",
             ],
         })
 
-        # ---- 2. HAC++ 不同 lambda_rate (率失真曲线) ----
+        # ---- 2. HAC++ 不同 lmbda (率失真曲线) ----
         for lr in lambda_rates:
             lr_str = f"{lr:.0e}" if lr > 0 else "0"
-            hac_path = f"{split_prefix}/hac_lr{lr_str}"
+            hac_path = f"{split_prefix}/hac_lmbda{lr_str}"
             experiments.append({
-                "name": f"{split_name}HAC++ (λ_rate={lr_str})",
+                "name": f"{split_name}HAC++ (λ={lr_str})",
                 "model_path": hac_path,
                 "cmd": ["python", "train.py"] + base_args + split["extra_args"] + [
                     "-m", hac_path,
                     "--port", "12341",
-                    "--use_hash_grid",
-                    "--lambda_rate", str(lr),
+                    "--lmbda", str(lr),
                 ],
             })
 
@@ -633,8 +631,8 @@ def main():
     parser.add_argument("--lod_values", nargs="+", type=int, default=[0],
                         help="当 split_mode=lod 时使用, 可传多个值做消融")
     parser.add_argument("--lambda_rates", nargs="+", type=float,
-                        default=[1e-4, 5e-4, 1e-3],
-                        help="HAC++ lambda_rate 列表 (消融实验: 不同压缩强度)")
+                        default=[5e-4, 1e-3, 2e-3],
+                        help="HAC++ lmbda 列表 (消融实验: 不同率失真权重, 越大压缩越强)")
     parser.add_argument("--voxel_size", type=float, default=0.001,
                         help="体素大小 (越大锚点越少, 越省显存; 默认 0.001)")
     parser.add_argument("--resolution", type=int, default=-1,
