@@ -47,7 +47,7 @@ class ParamGroup:
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
-        self.feat_dim = 32
+        self.feat_dim = 50              # 对齐 HAC-plus (原 32)
         self.n_offsets = 10
         self.voxel_size =  0.001 # if voxel_size<=0, using 1nn dist
         self.update_depth = 3
@@ -61,39 +61,9 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
-        self.eval = False
+        self.eval = True                # 对齐 HAC-plus: 默认开启 train/test 分割
         self.lod = 0
-        self.llffhold = 8
-
-        self.appearance_dim = 32
-        self.lowpoly = False
-        self.ds = 1
-        self.ratio = 1 # sampling the input point cloud
-        self.undistorted = False 
-        
-        # In the Bungeenerf dataset, we propose to set the following three parameters to True,
-        # Because there are enough dist variations.
-        self.add_opacity_dist = False
-        self.add_cov_dist = False
-        self.add_color_dist = False
-
-        # ---- HAC++ 参数 ----
-        self.use_hash_grid = False
-        self.hash_n_levels = 16
-        self.hash_n_features_per_level = 2       # 每层特征维度 (hash_feat_dim = 16*2 = 32)
-        self.hash_log2_hashmap_size = 19          # 哈希表大小 T=2^19=512K (~64MB)
-        self.hash_base_resolution = 16
-        self.hash_max_resolution = 4096           # 提升: 2048→4096 (适度提升分辨率)
-        self.context_hidden_dim = 128             # 提升: 64→128, 增大 MLP 容量
-        self.geometry_context_dim = 64            # 提升: 32→64
-        self.aqm_init_step_size = 0.01
-        self.lambda_rate = 0.0001
-        # ---- HAC++ 渐进式训练调度 ----
-        # Phase 1 [0, aqm_start): 纯失真训练, 不加量化噪声和 Rate Loss
-        # Phase 2 [aqm_start, rate_start): 启用 AQM 量化, 仍不加 Rate Loss
-        # Phase 3 [rate_start, end): 完整 Rate-Distortion 联合训练
-        self.aqm_start_iter = 10000               # 启用 AQM 量化的迭代次数
-        self.rate_start_iter = 20000              # 启用 Rate Loss 的迭代次数
+        self.llffhold = 8              # 每隔 llffhold 张取 1 张作为测试集
 
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -122,6 +92,12 @@ class OptimizationParams(ParamGroup):
         self.offset_lr_delay_mult = 0.01
         self.offset_lr_max_steps = 30_000
 
+        # 对齐 HAC-plus: 添加 mask 学习率
+        self.mask_lr_init = 0.01
+        self.mask_lr_final = 0.0001
+        self.mask_lr_delay_mult = 0.01
+        self.mask_lr_max_steps = 30_000
+
         self.feature_lr = 0.0075
         self.opacity_lr = 0.02
         self.scaling_lr = 0.007
@@ -142,21 +118,27 @@ class OptimizationParams(ParamGroup):
         self.mlp_color_lr_final = 0.00005
         self.mlp_color_lr_delay_mult = 0.01
         self.mlp_color_lr_max_steps = 30_000
-
-        self.mlp_color_lr_init = 0.008
-        self.mlp_color_lr_final = 0.00005
-        self.mlp_color_lr_delay_mult = 0.01
-        self.mlp_color_lr_max_steps = 30_000
         
         self.mlp_featurebank_lr_init = 0.01
         self.mlp_featurebank_lr_final = 0.00001
         self.mlp_featurebank_lr_delay_mult = 0.01
         self.mlp_featurebank_lr_max_steps = 30_000
 
-        self.appearance_lr_init = 0.05
-        self.appearance_lr_final = 0.0005
-        self.appearance_lr_delay_mult = 0.01
-        self.appearance_lr_max_steps = 30_000
+        # 对齐 HAC-plus: 编码器和上下文 MLP 学习率
+        self.encoding_xyz_lr_init = 0.005
+        self.encoding_xyz_lr_final = 0.00001
+        self.encoding_xyz_lr_delay_mult = 0.33
+        self.encoding_xyz_lr_max_steps = 30_000
+
+        self.mlp_grid_lr_init = 0.005
+        self.mlp_grid_lr_final = 0.00001
+        self.mlp_grid_lr_delay_mult = 0.01
+        self.mlp_grid_lr_max_steps = 30_000
+
+        self.mlp_deform_lr_init = 0.005
+        self.mlp_deform_lr_final = 0.0005
+        self.mlp_deform_lr_delay_mult = 0.01
+        self.mlp_deform_lr_max_steps = 30_000
 
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
@@ -170,15 +152,6 @@ class OptimizationParams(ParamGroup):
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
-
-        # ---- HAC++ compression parameters ----
-        self.hac_enabled = False          # Enable HAC++ compression
-        self.hac_start = 3000             # Start noise injection (freeze densification)
-        self.hac_entropy_start = 10000    # Enable entropy loss + hash grid + adaptive Q
-        self.hac_lambda = 4e-3            # Rate-distortion trade-off weight
-        self.hac_sample_ratio = 0.05      # Fraction of anchors for entropy loss per iter
-        self.hac_hash_lr = 1e-3           # Hash grid learning rate
-        self.hac_context_lr = 5e-4        # Context model learning rate
 
         super().__init__(parser, "Optimization Parameters")
 

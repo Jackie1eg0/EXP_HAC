@@ -8,166 +8,247 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+# Restructured to match HAC-plus renderer:
+#   - Direct parameter access (no hash grid decode)
+#   - 3-phase quantization schedule  
+#   - Binary grid masks for per-offset pruning
+#   - Entropy estimation during training (step > 10000)
+#
+
+import time
+
 import torch
 from einops import repeat
 
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
+from utils.encodings import STE_binary, STE_multistep
 
-def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False):
-    ## view frustum filtering for acceleration    
+
+def generate_neural_gaussians(viewpoint_camera, pc: GaussianModel, visible_mask=None, is_training=False, step=0):
+    """Generate neural Gaussians from anchors, following HAC-plus architecture."""
+
+    time_sub = 0
+
     if visible_mask is None:
-        visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
+        visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device=pc.get_anchor.device)
 
+    # Direct parameter access (NOT hash-grid-decoded)
     anchor = pc.get_anchor[visible_mask]
+    feat = pc._anchor_feat[visible_mask]
+    grid_offsets = pc._offset[visible_mask]
+    grid_scaling = pc.get_scaling[visible_mask]
+    binary_grid_masks = pc.get_mask[visible_mask]  # [N_vis, n_offsets, 1]
 
-    ## get view properties for anchor
+    # ============================================================
+    #  Quantization Schedule (aligned with HAC-plus)
+    # ============================================================
+    bit_per_param = None
+    bit_per_feat_param = None
+    bit_per_scaling_param = None
+    bit_per_offsets_param = None
+    Q_feat = 1
+    Q_scaling = 0.001
+    Q_offsets = 0.2
+
+    if is_training:
+        # Phase 1: [0, 3000] — no quantization, pure distortion training
+        # Phase 2: (3000, 10000] — uniform noise injection
+        if step > 3000 and step <= 10000:
+            feat = feat + torch.empty_like(feat).uniform_(-0.5, 0.5) * Q_feat
+            grid_scaling = grid_scaling + torch.empty_like(grid_scaling).uniform_(-0.5, 0.5) * Q_scaling
+            grid_offsets = grid_offsets + torch.empty_like(grid_offsets).uniform_(-0.5, 0.5) * Q_offsets
+
+        # Update anchor bounds at transition
+        if step == 10000:
+            pc.update_anchor_bound()
+
+        # Phase 3: (10000, end) — adaptive quantization + entropy estimation
+        if step > 10000:
+            # For rendering: adaptive Q noise on visible anchors
+            feat_context_orig = pc.calc_interp_feat(anchor)
+            feat_context = pc.get_grid_mlp(feat_context_orig)
+            mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
+                torch.split(feat_context, split_size_or_sections=[
+                    pc.feat_dim, pc.feat_dim, pc.feat_dim,
+                    6, 6,
+                    3 * pc.n_offsets, 3 * pc.n_offsets,
+                    1, 1, 1
+                ], dim=-1)
+
+            Q_feat = Q_feat * (1 + torch.tanh(Q_feat_adj))
+            Q_scaling = Q_scaling * (1 + torch.tanh(Q_scaling_adj))
+            Q_offsets = Q_offsets * (1 + torch.tanh(Q_offsets_adj))
+            feat = feat + torch.empty_like(feat).uniform_(-0.5, 0.5) * Q_feat
+            grid_scaling = grid_scaling + torch.empty_like(grid_scaling).uniform_(-0.5, 0.5) * Q_scaling
+            grid_offsets = grid_offsets + torch.empty_like(grid_offsets).uniform_(-0.5, 0.5) * Q_offsets.unsqueeze(1)
+
+            # For entropy estimation: sample 5% of ALL anchors
+            choose_idx = torch.rand_like(pc.get_anchor[:, 0]) <= 0.05
+            anchor_chosen = pc.get_anchor[choose_idx]
+            feat_chosen = pc._anchor_feat[choose_idx]
+            grid_offsets_chosen = pc._offset[choose_idx]
+            grid_scaling_chosen = pc.get_scaling[choose_idx]
+            binary_grid_masks_chosen = pc.get_mask[choose_idx]
+            mask_anchor_chosen = pc.get_mask_anchor[choose_idx]
+
+            feat_context_orig = pc.calc_interp_feat(anchor_chosen)
+            feat_context = pc.get_grid_mlp(feat_context_orig)
+            mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
+                torch.split(feat_context, split_size_or_sections=[
+                    pc.feat_dim, pc.feat_dim, pc.feat_dim,
+                    6, 6,
+                    3 * pc.n_offsets, 3 * pc.n_offsets,
+                    1, 1, 1
+                ], dim=-1)
+
+            Q_feat_e = 1
+            Q_scaling_e = 0.001
+            Q_offsets_e = 0.2
+            Q_feat_adj = Q_feat_adj.contiguous().repeat(1, mean.shape[-1])
+            Q_scaling_adj = Q_scaling_adj.contiguous().repeat(1, mean_scaling.shape[-1])
+            Q_offsets_adj = Q_offsets_adj.contiguous().repeat(1, mean_offsets.shape[-1])
+            Q_feat_e = Q_feat_e * (1 + torch.tanh(Q_feat_adj))
+            Q_scaling_e = Q_scaling_e * (1 + torch.tanh(Q_scaling_adj))
+            Q_offsets_e = Q_offsets_e * (1 + torch.tanh(Q_offsets_adj)).view(-1, pc.n_offsets, 3)
+
+            feat_chosen = feat_chosen + torch.empty_like(feat_chosen).uniform_(-0.5, 0.5) * Q_feat_e
+            mean_adj, scale_adj, prob_adj = pc.get_deform_mlp.forward(feat_chosen, torch.cat([mean, scale, prob], dim=-1))
+            probs = torch.stack([prob, prob_adj], dim=-1)
+            probs = torch.softmax(probs, dim=-1)
+
+            grid_scaling_chosen = grid_scaling_chosen + torch.empty_like(grid_scaling_chosen).uniform_(-0.5, 0.5) * Q_scaling_e
+            grid_offsets_chosen = grid_offsets_chosen + torch.empty_like(grid_offsets_chosen).uniform_(-0.5, 0.5) * Q_offsets_e
+            grid_offsets_chosen = grid_offsets_chosen.view(-1, 3 * pc.n_offsets)
+            binary_grid_masks_chosen = binary_grid_masks_chosen.repeat(1, 1, 3).view(-1, 3 * pc.n_offsets)
+
+            bit_feat = pc.EG_mix_prob_2.forward(feat_chosen,
+                                                mean, mean_adj,
+                                                scale, scale_adj,
+                                                probs[..., 0], probs[..., 1],
+                                                Q=Q_feat_e, x_mean=pc._anchor_feat.mean())
+            bit_feat = bit_feat * mask_anchor_chosen
+            bit_scaling = pc.entropy_gaussian.forward(grid_scaling_chosen, mean_scaling, scale_scaling, Q_scaling_e, pc.get_scaling.mean())
+            bit_scaling = bit_scaling * mask_anchor_chosen
+            bit_offsets = pc.entropy_gaussian.forward(grid_offsets_chosen, mean_offsets, scale_offsets,
+                                                     Q_offsets_e.view(-1, 3 * pc.n_offsets), pc._offset.mean())
+            bit_offsets = bit_offsets * mask_anchor_chosen * binary_grid_masks_chosen
+
+            bit_per_feat_param = torch.sum(bit_feat) / bit_feat.numel()
+            bit_per_scaling_param = torch.sum(bit_scaling) / bit_scaling.numel()
+            bit_per_offsets_param = torch.sum(bit_offsets) / bit_offsets.numel()
+            bit_per_param = (torch.sum(bit_feat) + torch.sum(bit_scaling) + torch.sum(bit_offsets)) / \
+                            (bit_feat.numel() + bit_scaling.numel() + bit_offsets.numel())
+
+    elif not pc.decoded_version:
+        # Inference: apply STE quantization
+        torch.cuda.synchronize(); t1 = time.time()
+        feat_context = pc.calc_interp_feat(anchor)
+        mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
+            torch.split(pc.get_grid_mlp(feat_context), split_size_or_sections=[
+                pc.feat_dim, pc.feat_dim, pc.feat_dim,
+                6, 6,
+                3 * pc.n_offsets, 3 * pc.n_offsets,
+                1, 1, 1
+            ], dim=-1)
+
+        Q_feat_adj = Q_feat_adj.contiguous().repeat(1, mean.shape[-1])
+        Q_scaling_adj = Q_scaling_adj.contiguous().repeat(1, mean_scaling.shape[-1])
+        Q_offsets_adj = Q_offsets_adj.contiguous().repeat(1, mean_offsets.shape[-1])
+        Q_feat = Q_feat * (1 + torch.tanh(Q_feat_adj))
+        Q_scaling = Q_scaling * (1 + torch.tanh(Q_scaling_adj))
+        Q_offsets = Q_offsets * (1 + torch.tanh(Q_offsets_adj)).view(-1, pc.n_offsets, 3)
+        feat = (STE_multistep.apply(feat, Q_feat, pc._anchor_feat.mean())).detach()
+        grid_scaling = (STE_multistep.apply(grid_scaling, Q_scaling, pc.get_scaling.mean())).detach()
+        grid_offsets = (STE_multistep.apply(grid_offsets, Q_offsets, pc._offset.mean())).detach()
+        torch.cuda.synchronize(); time_sub = time.time() - t1
+    else:
+        pass  # decoded_version: use raw values
+
+    # ============================================================
+    #  View-dependent Feature Processing
+    # ============================================================
     ob_view = anchor - viewpoint_camera.camera_center
     ob_dist = ob_view.norm(dim=1, keepdim=True)
     ob_view = ob_view / ob_dist
 
-    # ================================================================
-    #  HAC++ 路径: HashGrid → ContextMLP (两阶段) → AQM
-    #  注意: 此路径不调用 get_quantized_attributes, 避免双重解码显存浪费
-    # ================================================================
-    if pc.use_hash_grid:
-        # Stage 1: 从 anchor 位置解码几何属性 (唯一一次 hash grid 查询)
-        decoded, rate_dict = pc.decode_anchor_attributes(anchor, is_training=is_training)
-        feat = decoded['anchor_feat']             # [N, feat_dim]  (已量化)
-        grid_offsets = decoded['offsets'].view(-1, pc.n_offsets, 3)  # [N, k, 3]
-        grid_scaling = pc.scaling_activation(decoded['scaling'])  # [N, 6]
-        geometry_context = decoded['geometry_context']
-        del decoded  # 及时释放 offsets/scaling/rotation/opacity 原始引用
+    if pc.use_feat_bank:
+        cat_view = torch.cat([ob_view, ob_dist], dim=1)
+        bank_weight = pc.get_featurebank_mlp(cat_view).unsqueeze(dim=1)
+        feat = feat.unsqueeze(dim=-1)
+        feat = \
+            feat[:, ::4, :1].repeat([1, 4, 1]) * bank_weight[:, :, :1] + \
+            feat[:, ::2, :1].repeat([1, 2, 1]) * bank_weight[:, :, 1:2] + \
+            feat[:, ::1, :1] * bank_weight[:, :, 2:]
+        feat = feat.squeeze(dim=-1)
 
-        # Stage 2: 基于几何上下文解码外观属性
-        appearance_embed = None
-        if pc.appearance_dim > 0:
-            camera_indicies = torch.ones_like(ob_view[:, 0], dtype=torch.long, device=anchor.device) * viewpoint_camera.uid
-            appearance_embed = pc.get_appearance(camera_indicies)
+    # ============================================================
+    #  MLP Inference (always include distance)
+    # ============================================================
+    cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1)
 
-        appear = pc.decode_appearance_from_context(
-            anchor_feat=feat,
-            geometry_context=geometry_context,
-            view_dir=ob_view,
-            ob_dist=ob_dist if pc.add_opacity_dist or pc.add_cov_dist or pc.add_color_dist else None,
-            appearance_embed=appearance_embed,
-        )
-        del geometry_context  # 释放几何上下文
-        neural_opacity = appear['neural_opacity']   # [N, k]
-        color = appear['color']                      # [N, 3*k]
-        scale_rot = appear['scale_rot']              # [N, 7*k]
-        del appear  # 释放 dict
-
-    # ================================================================
-    #  原始 Scaffold-GS 路径 (或 hac_mode 0/1 回退)
-    # ================================================================
-    else:
-        rate_dict = {}
-        feat = pc._anchor_feat[visible_mask]
-        grid_offsets = pc._offset[visible_mask]
-        grid_scaling = pc.get_scaling[visible_mask]
-
-        ## view-adaptive feature
-        if pc.use_feat_bank:
-            cat_view = torch.cat([ob_view, ob_dist], dim=1)
-            bank_weight = pc.get_featurebank_mlp(cat_view).unsqueeze(dim=1)
-            feat = feat.unsqueeze(dim=-1)
-            feat = feat[:,::4, :1].repeat([1,4,1])*bank_weight[:,:,:1] + \
-                feat[:,::2, :1].repeat([1,2,1])*bank_weight[:,:,1:2] + \
-                feat[:,::1, :1]*bank_weight[:,:,2:]
-            feat = feat.squeeze(dim=-1)
-
-        cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1)
-        cat_local_view_wodist = torch.cat([feat, ob_view], dim=1)
-        if pc.appearance_dim > 0:
-            camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
-            appearance = pc.get_appearance(camera_indicies)
-
-        if pc.add_opacity_dist:
-            neural_opacity = pc.get_opacity_mlp(cat_local_view)
-        else:
-            neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
-
-        if pc.appearance_dim > 0:
-            if pc.add_color_dist:
-                color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
-            else:
-                color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
-        else:
-            if pc.add_color_dist:
-                color = pc.get_color_mlp(cat_local_view)
-            else:
-                color = pc.get_color_mlp(cat_local_view_wodist)
-
-        if pc.add_cov_dist:
-            scale_rot = pc.get_cov_mlp(cat_local_view)
-        else:
-            scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
-        
-        # 释放中间变量
-        del cat_local_view, cat_local_view_wodist
-
-    # ================================================================
-    #  以下为两种模式的公共后处理
-    # ================================================================
-    color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])
-    scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7])
-
-    # opacity mask generation
+    neural_opacity = pc.get_opacity_mlp(cat_local_view)
     neural_opacity = neural_opacity.reshape([-1, 1])
-    mask = (neural_opacity>0.0)
+    mask = (neural_opacity > 0.0)
     mask = mask.view(-1)
     opacity = neural_opacity[mask]
 
-    # 释放解码阶段不再需要的变量, 为光栅化器腾出显存
-    del feat
-    if 'ob_view' in dir():
-        pass  # ob_view 已在局部作用域结束
+    color = pc.get_color_mlp(cat_local_view)
+    color = color.reshape([anchor.shape[0] * pc.n_offsets, 3])
 
-    # offsets
+    scale_rot = pc.get_cov_mlp(cat_local_view)
+    scale_rot = scale_rot.reshape([anchor.shape[0] * pc.n_offsets, 7])
+
+    # ============================================================
+    #  Post-processing
+    # ============================================================
     offsets = grid_offsets.view([-1, 3])
-    
-    # combine for parallel masking
     concatenated = torch.cat([grid_scaling, anchor], dim=-1)
-    del grid_scaling  # 已合并, 不再需要
     concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    del concatenated
     concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
-    del concatenated_repeated, offsets
     masked = concatenated_all[mask]
-    del concatenated_all
     scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
-    del masked
-    
-    # post-process cov
-    scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3])
-    rot = pc.rotation_activation(scale_rot[:,3:7])
-    
-    # post-process offsets to get centers for gaussians
-    offsets = offsets * scaling_repeat[:,:3]
+
+    scaling = scaling_repeat[:, 3:] * torch.sigmoid(scale_rot[:, :3])
+    rot = pc.rotation_activation(scale_rot[:, 3:7])
+    offsets = offsets * scaling_repeat[:, :3]
     xyz = repeat_anchor + offsets
 
+    # ============================================================
+    #  Binary Grid Mask Application (from HAC-plus)
+    # ============================================================
+    binary_grid_masks_pergaussian = binary_grid_masks.view(-1, 1)
     if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask, rate_dict
+        opacity = opacity * binary_grid_masks_pergaussian[mask]
+        scaling = scaling * binary_grid_masks_pergaussian[mask]
     else:
-        return xyz, color, opacity, scaling, rot
+        the_mask = (binary_grid_masks_pergaussian[mask]).to(torch.bool)
+        the_mask = the_mask[:, 0]
+        xyz = xyz[the_mask]
+        color = color[the_mask]
+        opacity = opacity[the_mask]
+        scaling = scaling[the_mask]
+        rot = rot[the_mask]
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
-    """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
-    """
+    if is_training:
+        return xyz, color, opacity, scaling, rot, neural_opacity, mask, bit_per_param, bit_per_feat_param, bit_per_scaling_param, bit_per_offsets_param
+    else:
+        return xyz, color, opacity, scaling, rot, time_sub
+
+
+def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0,
+           visible_mask=None, retain_grad=False, step=0):
+    """Render the scene."""
     is_training = pc.get_color_mlp.training
-        
-    if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask, rate_dict = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    else:
-        xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    
 
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    if is_training:
+        xyz, color, opacity, scaling, rot, neural_opacity, mask, bit_per_param, bit_per_feat_param, bit_per_scaling_param, bit_per_offsets_param = \
+            generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, step=step)
+    else:
+        xyz, color, opacity, scaling, rot, time_sub = \
+            generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, step=step)
+
     screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
     if retain_grad:
         try:
@@ -175,8 +256,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         except:
             pass
 
-
-    # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
@@ -197,55 +276,47 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    # [显存优化] 仅在显存碎片化严重时清理缓存 (避免每次迭代都清理的开销)
-    free_mem, total_mem = torch.cuda.mem_get_info()
-    if free_mem / total_mem < 0.2:  # 可用显存低于 20% 时清理
-        torch.cuda.empty_cache()
-
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii = rasterizer(
-        means3D = xyz,
-        means2D = screenspace_points,
-        shs = None,
-        colors_precomp = color,
-        opacities = opacity,
-        scales = scaling,
-        rotations = rot,
-        cov3D_precomp = None)
-    
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+        means3D=xyz,
+        means2D=screenspace_points,
+        shs=None,
+        colors_precomp=color,
+        opacities=opacity,
+        scales=scaling,
+        rotations=rot,
+        cov3D_precomp=None)
+
     if is_training:
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
+                "visibility_filter": radii > 0,
                 "radii": radii,
                 "selection_mask": mask,
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
-                "rate_dict": rate_dict,
+                "bit_per_param": bit_per_param,
+                "bit_per_feat_param": bit_per_feat_param,
+                "bit_per_scaling_param": bit_per_scaling_param,
+                "bit_per_offsets_param": bit_per_offsets_param,
                 }
     else:
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
+                "visibility_filter": radii > 0,
                 "radii": radii,
+                "time_sub": time_sub,
                 }
 
 
-def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
-    """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
-    """
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+def prefilter_voxel(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0,
+                    override_color=None):
+    """View frustum culling for voxels."""
     screenspace_points = torch.zeros_like(pc.get_anchor, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
     except:
         pass
 
-    # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
@@ -267,10 +338,6 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     means3D = pc.get_anchor
-
-
-    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-    # scaling / rotation by the rasterizer.
     scales = None
     rotations = None
     cov3D_precomp = None
@@ -280,9 +347,11 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
         scales = pc.get_scaling
         rotations = pc.get_rotation
 
-    radii_pure = rasterizer.visible_filter(means3D = means3D,
-        scales = scales[:,:3],
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
+    radii_pure = rasterizer.visible_filter(
+        means3D=means3D,
+        scales=scales[:, :3],
+        rotations=rotations,
+        cov3D_precomp=cov3D_precomp,
+    )
 
     return radii_pure > 0

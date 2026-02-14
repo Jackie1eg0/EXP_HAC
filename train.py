@@ -8,17 +8,15 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+# Restructured to match HAC-plus training pipeline:
+#   - 3-phase quantization schedule
+#   - Rate-distortion loss with binary hash grid entropy
+#   - Densification pauses only [3000, 4000) for quantization adaptation
+#   - step=iteration passed to renderer
+#
 
 import os
 import numpy as np
-
-import subprocess
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
-
-os.system('echo $CUDA_VISIBLE_DEVICES')
-
 
 import torch
 import torchvision
@@ -30,7 +28,6 @@ import shutil, pathlib
 from pathlib import Path
 from PIL import Image
 import torchvision.transforms.functional as tf
-# from lpipsPyTorch import lpips
 import lpips
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -43,17 +40,20 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.encodings import get_binary_vxl_size
 
 # torch.set_num_threads(32)
-# 延迟加载 lpips 到 GPU: 仅在评估时使用, 训练期间不占用显存
+# Lazy load LPIPS to save GPU memory during training
 lpips_fn = None
 
 def get_lpips_fn():
-    """延迟加载 LPIPS 模型到 GPU，节省训练阶段约 100MB 显存。"""
+    """Lazy-load LPIPS model to GPU."""
     global lpips_fn
     if lpips_fn is None:
         lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
     return lpips_fn
+
+bit2MB_scale = 8 * 1024 * 1024
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -80,69 +80,50 @@ def saveRuntimeCode(dst: str) -> None:
         ignorePatterns.append(additionalPattern)
 
     log_dir = pathlib.Path(__file__).parent.resolve()
-
-
     shutil.copytree(log_dir, dst, ignore=shutil.ignore_patterns(*ignorePatterns))
-    
     print('Backup Finished!')
 
 
-def create_gaussian_model(dataset):
-    """根据 dataset 参数构造 GaussianModel (兼容原始模式和 HAC++ 模式)。"""
-    return GaussianModel(
-        feat_dim=dataset.feat_dim,
-        n_offsets=dataset.n_offsets,
-        voxel_size=dataset.voxel_size,
-        update_depth=dataset.update_depth,
-        update_init_factor=dataset.update_init_factor,
-        update_hierachy_factor=dataset.update_hierachy_factor,
-        use_feat_bank=dataset.use_feat_bank,
-        appearance_dim=dataset.appearance_dim,
-        ratio=dataset.ratio,
-        add_opacity_dist=dataset.add_opacity_dist,
-        add_cov_dist=dataset.add_cov_dist,
-        add_color_dist=dataset.add_color_dist,
-        # HAC++ 参数
-        use_hash_grid=dataset.use_hash_grid,
-        hash_n_levels=dataset.hash_n_levels,
-        hash_n_features_per_level=dataset.hash_n_features_per_level,
-        hash_log2_hashmap_size=dataset.hash_log2_hashmap_size,
-        hash_base_resolution=dataset.hash_base_resolution,
-        hash_max_resolution=dataset.hash_max_resolution,
-        context_hidden_dim=dataset.context_hidden_dim,
-        geometry_context_dim=dataset.geometry_context_dim,
-        aqm_init_step_size=dataset.aqm_init_step_size,
-        lambda_rate=dataset.lambda_rate,
-        aqm_start_iter=dataset.aqm_start_iter,
-        rate_start_iter=dataset.rate_start_iter,
-    )
-
-
-def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
+def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = create_gaussian_model(dataset)
-    
-    # [显存优化] 在创建 Scene 前清理缓存
+
+    # Detect synthetic NeRF datasets (Blender) for model variant selection
+    is_synthetic_nerf = os.path.exists(os.path.join(dataset.source_path, "transforms_train.json"))
+
+    gaussians = GaussianModel(
+        dataset.feat_dim,
+        dataset.n_offsets,
+        dataset.voxel_size,
+        dataset.update_depth,
+        dataset.update_init_factor,
+        dataset.update_hierachy_factor,
+        dataset.use_feat_bank,
+        hash_n_features_per_level=args_param.n_features,
+        hash_log2_hashmap_size=args_param.log2,
+        is_synthetic_nerf=is_synthetic_nerf,
+    )
+
+    # [Memory optimization] Clear cache before scene creation
     torch.cuda.empty_cache()
-    scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
+    scene = Scene(dataset, gaussians, ply_path=ply_path)
+    gaussians.update_anchor_bound()
+
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
-
-    # [显存优化] 预先创建 background tensor, 避免每次迭代重新分配
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    torch.cuda.synchronize(); t_start = time.time()
+    log_time_sub = 0
+    for iteration in range(first_iter, opt.iterations + 1):
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -161,190 +142,146 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         iter_start.record()
 
-        # ---- HAC++ 渐进训练: 同步当前迭代次数 + 阶段日志 ----
-        gaussians.current_iteration = iteration
-        if gaussians.use_hash_grid:
-            if iteration == gaussians.aqm_start_iter:
-                logger.info(f"\n[HAC++ Phase 2] iter {iteration}: 启用 AQM 量化 (STE)")
-            if iteration == gaussians.rate_start_iter:
-                logger.info(f"\n[HAC++ Phase 3] iter {iteration}: 启用 Rate-Distortion Loss (λ_rate={gaussians.lambda_rate})")
-
         gaussians.update_learning_rate(iteration)
 
-        # ============ HAC++ Milestone Checks ============
-        if opt.hac_enabled:
-            if iteration == opt.hac_start:
-                gaussians.hac_mode = 1
-                logger.info(
-                    f"\n[HAC++ iter {iteration}] Noise injection ON "
-                    f"(base Q0). Densification frozen.")
-            if iteration == opt.hac_entropy_start:
-                gaussians.init_hac()
-                gaussians.add_hac_to_optimizer(
-                    opt.hac_hash_lr, opt.hac_context_lr)
-                gaussians.hac_mode = 2
-                logger.info(
-                    f"\n[HAC++ iter {iteration}] Full mode ON "
-                    f"(hash grid + adaptive Q + entropy loss).")
+        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-        
+
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
-        
-        image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background,
+                            visible_mask=voxel_visible_mask, retain_grad=retain_grad,
+                            step=iteration)
 
+        image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = \
+            render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], \
+            render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+
+        # Extract bitrate info from renderer
+        bit_per_param = render_pkg["bit_per_param"]
+        bit_per_feat_param = render_pkg["bit_per_feat_param"]
+        bit_per_scaling_param = render_pkg["bit_per_scaling_param"]
+        bit_per_offsets_param = render_pkg["bit_per_offsets_param"]
+
+        # Log bitrate info periodically
+        if iteration % 1000 == 0 and bit_per_param is not None:
+            ttl_size_feat_MB = bit_per_feat_param.item() * gaussians.get_anchor.shape[0] * gaussians.feat_dim / bit2MB_scale
+            ttl_size_scaling_MB = bit_per_scaling_param.item() * gaussians.get_anchor.shape[0] * 6 / bit2MB_scale
+            ttl_size_offsets_MB = bit_per_offsets_param.item() * gaussians.get_anchor.shape[0] * 3 * gaussians.n_offsets / bit2MB_scale
+            ttl_size_MB = ttl_size_feat_MB + ttl_size_scaling_MB + ttl_size_offsets_MB
+
+            logger.info("\n----------------------------------------------------------------------------------------")
+            logger.info("\n-----[ITER {}] bits info: bit_per_feat_param={}, anchor_num={}, ttl_size_feat_MB={}-----".format(
+                iteration, bit_per_feat_param.item(), gaussians.get_anchor.shape[0], ttl_size_feat_MB))
+            logger.info("\n-----[ITER {}] bits info: bit_per_scaling_param={}, anchor_num={}, ttl_size_scaling_MB={}-----".format(
+                iteration, bit_per_scaling_param.item(), gaussians.get_anchor.shape[0], ttl_size_scaling_MB))
+            logger.info("\n-----[ITER {}] bits info: bit_per_offsets_param={}, anchor_num={}, ttl_size_offsets_MB={}-----".format(
+                iteration, bit_per_offsets_param.item(), gaussians.get_anchor.shape[0], ttl_size_offsets_MB))
+            logger.info("\n-----[ITER {}] bits info: bit_per_param={}, anchor_num={}, ttl_size_MB={}-----".format(
+                iteration, bit_per_param.item(), gaussians.get_anchor.shape[0], ttl_size_MB))
+            with torch.no_grad():
+                binary_grid_masks_anchor = gaussians.get_mask_anchor.float()
+                mask_1_rate, mask_size_bit, mask_size_MB, mask_numel = get_binary_vxl_size(binary_grid_masks_anchor + 0.0)
+            logger.info("\n-----[ITER {}] bits info: 1_rate_mask={}, mask_numel={}, mask_size_MB={}-----".format(
+                iteration, mask_1_rate, mask_numel, mask_size_MB))
+
+        # ============================================================
+        #  Loss Computation (aligned with HAC-plus)
+        # ============================================================
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg
 
-        if gaussians.use_hash_grid and iteration >= gaussians.rate_start_iter:
-            # ---- HAC++ Phase 3: 完整 Rate-Distortion Loss ----
-            rate_dict = render_pkg.get("rate_dict", {})
-            loss, loss_info = gaussians.rd_loss(
-                rendered_image=image,
-                gt_image=gt_image,
-                rate_dict=rate_dict,
-                l1_loss_fn=l1_loss,
-                ssim_fn=ssim,
-                scaling_reg=scaling_reg,
-            )
-        else:
-            # ---- Scaffold-GS 标准 loss / HAC++ Phase 1&2: 纯失真 loss ----
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
-
-        # ============ HAC++ Entropy Loss (Eq. 11 + 12) ============
-        loss_hac = torch.tensor(0.0, device="cuda")
-        if (opt.hac_enabled
-                and iteration >= opt.hac_entropy_start
-                and gaussians.hac_mode >= 2):
-            N_total = gaussians.get_anchor.shape[0]
-            visible_indices = torch.where(voxel_visible_mask)[0]
-            N_visible = visible_indices.shape[0]
-            N_sample = max(1, int(N_total * opt.hac_sample_ratio))
-            N_sample = min(N_sample, N_visible)
-
-            with torch.no_grad():
-                perm = torch.randperm(N_visible, device='cuda')[:N_sample]
-            sample_global = visible_indices[perm]
-
-            # Entropy of sampled anchors
-            (bits_feat, bits_scaling, bits_offset,
-             _, _, _) = gaussians.compute_entropy_loss(sample_global)
-
-            # Mask-Aware Rate (Eq. 11)
-            # m_bar = per-anchor average offset opacity from rendering
-            neural_op_per_anchor = opacity.view(
-                -1, gaussians.n_offsets)            # [N_vis, K]
-            m_bar = neural_op_per_anchor[perm].mean(dim=1)   # [S]
-            indicator = (m_bar > 0).float()
-            # STE: forward = indicator, gradient through m_bar
-            m_a = (indicator - m_bar).detach() + m_bar
-
-            total_bits = (bits_feat + bits_scaling + bits_offset) * m_a
-            # Scale from sample to full set
-            L_entropy = total_bits.sum() / N_sample * N_total
-
-            # Hash grid binary entropy (Eq. 12)
-            L_hash = gaussians.hash_grid.get_binary_loss()
-
-            # Normalise by total compressed parameters
-            N_params = N_total * (
-                gaussians.feat_dim
-                + gaussians._scaling.shape[1]
-                + gaussians.n_offsets * 3)
-            loss_hac = opt.hac_lambda * (L_entropy + L_hash) / N_params
-            loss = loss + loss_hac
+        # Rate loss (only active when entropy estimation is running, i.e., step > 10000)
+        if bit_per_param is not None:
+            _, bit_hash_grid, MB_hash_grid, _ = get_binary_vxl_size((gaussians.get_encoding_params() + 1) / 2)
+            denom = gaussians._anchor.shape[0] * (gaussians.feat_dim + 6 + 3 * gaussians.n_offsets)
+            loss = loss + args_param.lmbda * (bit_per_param + bit_hash_grid / denom)
 
         loss.backward()
-        
-        # [显存优化] 及时释放不再需要的中间变量 (Ll1 需保留到 training_report)
-        del render_pkg, gt_image, ssim_loss, scaling_reg
-        
+
         iter_end.record()
 
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
 
-            if iteration % 10 == 0:
+            if iteration % 100 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-                progress_bar.update(10)
+                progress_bar.update(100)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            if tb_writer and opt.hac_enabled and iteration >= opt.hac_entropy_start:
-                tb_writer.add_scalar(
-                    f'{dataset_name}/train_loss_patches/hac_loss',
-                    loss_hac.item(), iteration)
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
-            del Ll1  # training_report 使用后释放
+            torch.cuda.synchronize(); t_start_log = time.time()
+            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss,
+                            iter_start.elapsed_time(iter_end), testing_iterations, scene,
+                            render, (pipe, background), wandb, logger, args_param.model_path)
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
-                # Save HAC++ checkpoints alongside Gaussians
-                if opt.hac_enabled and gaussians.hac_mode >= 2:
-                    hac_save_path = os.path.join(
-                        scene.model_path,
-                        f"point_cloud/iteration_{iteration}")
-                    gaussians.save_hac_checkpoints(hac_save_path)
-            
-            # densification
-            # HAC++: freeze densification at hac_start (anchor set must be
-            # stable before quantisation noise is introduced)
-            effective_update_until = (
-                min(opt.update_until, opt.hac_start)
-                if opt.hac_enabled else opt.update_until)
+            torch.cuda.synchronize(); t_end_log = time.time()
+            t_log = t_end_log - t_start_log
+            log_time_sub += t_log
 
-            if iteration < effective_update_until and iteration > opt.start_stat:
-                # add statis
-                gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
-                
-                # densification
-                if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                    gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
-            elif iteration == effective_update_until:
+            # ============================================================
+            #  Densification (aligned with HAC-plus)
+            #  Pause only in [3000, 4000) to let model adapt to quantization
+            # ============================================================
+            if iteration < opt.update_until and iteration > opt.start_stat:
+                # add statistics
+                gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter,
+                                          offset_selection_mask, voxel_visible_mask)
+                if iteration not in range(3000, 4000):  # let the model adapt to quantization noise
+                    # densification
+                    if iteration > opt.update_from and iteration % opt.update_interval == 0:
+                        gaussians.adjust_anchor(check_interval=opt.update_interval,
+                                                success_threshold=opt.success_threshold,
+                                                grad_threshold=opt.densify_grad_threshold,
+                                                min_opacity=opt.min_opacity)
+            elif iteration == opt.update_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
                 del gaussians.offset_denom
                 torch.cuda.empty_cache()
-                    
+
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
-            
-            # [显存优化] 定期清理碎片化显存
-            if iteration % 1000 == 0:
-                torch.cuda.empty_cache()
-                
+                gaussians.optimizer.zero_grad(set_to_none=True)
+
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-def prepare_output_and_logger(args):    
+    torch.cuda.synchronize(); t_end = time.time()
+    logger.info("\n Total Training time: {}".format(t_end - t_start - log_time_sub))
+
+    return gaussians.x_bound_min, gaussians.x_bound_max
+
+
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
+            unique_str = os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
-        
+
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
+    os.makedirs(args.model_path, exist_ok=True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
@@ -356,72 +293,95 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
+
+def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed,
+                    testing_iterations, scene: Scene, renderFunc, renderArgs,
+                    wandb=None, logger=None, pre_path_name=''):
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
 
-
     if wandb is not None:
-        wandb.log({"train_l1_loss":Ll1, 'train_total_loss':loss, })
-    
+        wandb.log({"train_l1_loss": Ll1, 'train_total_loss': loss})
+
     # Report test and samples of training set
     if iteration in testing_iterations:
         scene.gaussians.eval()
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        validation_configs = (
+            {'name': 'test', 'cameras': scene.getTestCameras()},
+            {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]}
+        )
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
-                
+                ssim_test = 0.0
+                lpips_test = 0.0
+
                 if wandb is not None:
                     gt_image_list = []
                     render_image_list = []
                     errormap_list = []
 
+                t_list = []
+
                 for idx, viewpoint in enumerate(config['cameras']):
+                    torch.cuda.synchronize(); t_s = time.time()
                     voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"], 0.0, 1.0)
+                    render_output = renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)
+                    image = torch.clamp(render_output["render"], 0.0, 1.0)
+                    time_sub = render_output.get("time_sub", 0)
+                    torch.cuda.synchronize(); t_e = time.time()
+                    t_list.append(t_e - t_s - time_sub)
+
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 30):
-                        tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=iteration)
+                        tb_writer.add_images(f'{dataset_name}/' + config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                        tb_writer.add_images(f'{dataset_name}/' + config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None] - image[None]).abs(), global_step=iteration)
 
                         if wandb:
                             render_image_list.append(image[None])
-                            errormap_list.append((gt_image[None]-image[None]).abs())
-                            
+                            errormap_list.append((gt_image[None] - image[None]).abs())
+
                         if iteration == testing_iterations[0]:
-                            tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                            tb_writer.add_images(f'{dataset_name}/' + config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                             if wandb:
                                 gt_image_list.append(gt_image[None])
 
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    ssim_test += ssim(image, gt_image).mean().double()
+                    lpips_test += get_lpips_fn()(image, gt_image, normalize=False).detach().mean().double()
 
-                
-                
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                logger.info("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                ssim_test /= len(config['cameras'])
+                lpips_test /= len(config['cameras'])
+                l1_test /= len(config['cameras'])
+                logger.info("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(
+                    iteration, config['name'], l1_test, psnr_test, ssim_test, lpips_test))
+                if len(t_list) > 0:
+                    test_fps = 1.0 / torch.tensor(t_list).mean()
+                    logger.info(f'Test FPS: {test_fps.item():.5f}')
+                    if tb_writer:
+                        tb_writer.add_scalar(f'{dataset_name}/test_FPS', test_fps.item(), 0)
 
-                
                 if tb_writer:
-                    tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(f'{dataset_name}/' + config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
+                    tb_writer.add_scalar(f'{dataset_name}/' + config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(f'{dataset_name}/' + config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
+                    tb_writer.add_scalar(f'{dataset_name}/' + config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
                 if wandb is not None:
-                    wandb.log({f"{config['name']}_loss_viewpoint_l1_loss":l1_test, f"{config['name']}_PSNR":psnr_test})
+                    wandb.log({f"{config['name']}_loss_viewpoint_l1_loss": l1_test, f"{config['name']}_PSNR": psnr_test})
 
         if tb_writer:
-            # tb_writer.add_histogram(f'{dataset_name}/'+"scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar(f'{dataset_name}/'+'total_points', scene.gaussians.get_anchor.shape[0], iteration)
+            tb_writer.add_scalar(f'{dataset_name}/' + 'total_points', scene.gaussians.get_anchor.shape[0], iteration)
         torch.cuda.empty_cache()
 
         scene.gaussians.train()
+
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -430,18 +390,17 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(render_path, exist_ok=True)
     makedirs(error_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
-    
+
     t_list = []
     visible_count_list = []
     name_list = []
     per_view_dict = {}
+    psnr_list = []
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        
-        torch.cuda.synchronize();t_start = time.time()
-        
+        torch.cuda.synchronize(); t_start = time.time()
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
         render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
-        torch.cuda.synchronize();t_end = time.time()
+        torch.cuda.synchronize(); t_end = time.time()
 
         t_list.append(t_end - t_start)
 
@@ -450,65 +409,77 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         visible_count = (render_pkg["radii"] > 0).sum()
         visible_count_list.append(visible_count)
 
-
         # gts
-        gt = view.original_image[0:3, :, :].cuda()
-        
+        gt = view.original_image[0:3, :, :]
+
+        # psnr per view
+        gt_image = torch.clamp(view.original_image.to("cuda"), 0.0, 1.0)
+        render_image = torch.clamp(rendering.to("cuda"), 0.0, 1.0)
+        psnr_view = psnr(render_image, gt_image).mean().double()
+        psnr_list.append(psnr_view)
+
         # error maps
         errormap = (rendering - gt).abs()
-
 
         name_list.append('{0:05d}'.format(idx) + ".png")
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
-    
+
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
-            json.dump(per_view_dict, fp, indent=True)
-    
+        json.dump(per_view_dict, fp, indent=True)
+
+    print('testing_float_psnr=:', sum(psnr_list) / len(psnr_list))
+
     return t_list, visible_count_list
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
+
+def render_sets(args_param, dataset: ModelParams, iteration: int, pipeline: PipelineParams,
+                skip_train=True, skip_test=False, wandb=None, tb_writer=None,
+                dataset_name=None, logger=None, x_bound_min=None, x_bound_max=None):
     with torch.no_grad():
-        gaussians = create_gaussian_model(dataset)
+        is_synthetic_nerf = os.path.exists(os.path.join(dataset.source_path, "transforms_train.json"))
+        gaussians = GaussianModel(
+            dataset.feat_dim,
+            dataset.n_offsets,
+            dataset.voxel_size,
+            dataset.update_depth,
+            dataset.update_init_factor,
+            dataset.update_hierachy_factor,
+            dataset.use_feat_bank,
+            hash_n_features_per_level=args_param.n_features,
+            hash_log2_hashmap_size=args_param.log2,
+            decoded_version=True,
+            is_synthetic_nerf=is_synthetic_nerf,
+        )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-
-        # Auto-detect and load HAC++ checkpoints for quantised rendering
-        hac_ckpt_dir = os.path.join(
-            dataset.model_path,
-            f"point_cloud/iteration_{scene.loaded_iter}")
-        hac_ckpt_file = os.path.join(hac_ckpt_dir, "hac_checkpoints.pth")
-        if os.path.exists(hac_ckpt_file):
-            gaussians.load_hac_checkpoints(hac_ckpt_dir)
-            if logger:
-                logger.info(
-                    f"[HAC++] Loaded compression model "
-                    f"(mode={gaussians.hac_mode}) for rendering.")
-
         gaussians.eval()
+        if x_bound_min is not None:
+            gaussians.x_bound_min = x_bound_min
+            gaussians.x_bound_max = x_bound_max
 
-        bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-        if not os.path.exists(dataset.model_path):
-            os.makedirs(dataset.model_path)
 
         if not skip_train:
-            t_train_list, visible_count  = render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
+            t_train_list, _ = render_set(dataset.model_path, "train", scene.loaded_iter,
+                                         scene.getTrainCameras(), gaussians, pipeline, background)
             train_fps = 1.0 / torch.tensor(t_train_list[5:]).mean()
             logger.info(f'Train FPS: \033[1;35m{train_fps.item():.5f}\033[0m')
             if wandb is not None:
-                wandb.log({"train_fps":train_fps.item(), })
+                wandb.log({"train_fps": train_fps.item()})
 
         if not skip_test:
-            t_test_list, visible_count = render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
+            t_test_list, visible_count = render_set(dataset.model_path, "test", scene.loaded_iter,
+                                                    scene.getTestCameras(), gaussians, pipeline, background)
             test_fps = 1.0 / torch.tensor(t_test_list[5:]).mean()
             logger.info(f'Test FPS: \033[1;35m{test_fps.item():.5f}\033[0m')
             if tb_writer:
                 tb_writer.add_scalar(f'{dataset_name}/test_FPS', test_fps.item(), 0)
             if wandb is not None:
-                wandb.log({"test_fps":test_fps, })
-    
+                wandb.log({"test_fps": test_fps})
+
     return visible_count
 
 
@@ -526,13 +497,12 @@ def readImages(renders_dir, gt_dir):
 
 
 def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, dataset_name=None, logger=None):
-
     full_dict = {}
     per_view_dict = {}
     full_dict_polytopeonly = {}
     per_view_dict_polytopeonly = {}
     print("")
-    
+
     scene_dir = model_paths
     full_dict[scene_dir] = {}
     per_view_dict[scene_dir] = {}
@@ -542,14 +512,13 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
     test_dir = Path(scene_dir) / "test"
 
     for method in os.listdir(test_dir):
-
         full_dict[scene_dir][method] = {}
         per_view_dict[scene_dir][method] = {}
         full_dict_polytopeonly[scene_dir][method] = {}
         per_view_dict_polytopeonly[scene_dir][method] = {}
 
         method_dir = test_dir / method
-        gt_dir = method_dir/ "gt"
+        gt_dir = method_dir / "gt"
         renders_dir = method_dir / "renders"
         renders, gts, image_names = readImages(renders_dir, gt_dir)
 
@@ -560,12 +529,12 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
         for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
             ssims.append(ssim(renders[idx], gts[idx]))
             psnrs.append(psnr(renders[idx], gts[idx]))
-            lpipss.append(get_lpips_fn()(renders[idx], gts[idx]).detach())
-        
+            lpipss.append(get_lpips_fn()(renders[idx], gts[idx], normalize=False).detach().mean().double())
+
         if wandb is not None:
-            wandb.log({"test_SSIMS":torch.stack(ssims).mean().item(), })
-            wandb.log({"test_PSNR_final":torch.stack(psnrs).mean().item(), })
-            wandb.log({"test_LPIPS":torch.stack(lpipss).mean().item(), })
+            wandb.log({"test_SSIMS": torch.stack(ssims).mean().item()})
+            wandb.log({"test_PSNR_final": torch.stack(psnrs).mean().item()})
+            wandb.log({"test_LPIPS": torch.stack(lpipss).mean().item()})
 
         logger.info(f"model_paths: \033[1;35m{model_paths}\033[0m")
         logger.info("  SSIM : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(ssims).mean(), ".5"))
@@ -573,34 +542,34 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
         logger.info("  LPIPS: \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(lpipss).mean(), ".5"))
         print("")
 
-
         if tb_writer:
             tb_writer.add_scalar(f'{dataset_name}/SSIM', torch.tensor(ssims).mean().item(), 0)
             tb_writer.add_scalar(f'{dataset_name}/PSNR', torch.tensor(psnrs).mean().item(), 0)
             tb_writer.add_scalar(f'{dataset_name}/LPIPS', torch.tensor(lpipss).mean().item(), 0)
-            
             tb_writer.add_scalar(f'{dataset_name}/VISIBLE_NUMS', torch.tensor(visible_count).mean().item(), 0)
-        
+
         full_dict[scene_dir][method].update({"SSIM": torch.tensor(ssims).mean().item(),
-                                                "PSNR": torch.tensor(psnrs).mean().item(),
-                                                "LPIPS": torch.tensor(lpipss).mean().item()})
-        per_view_dict[scene_dir][method].update({"SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
-                                                    "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
-                                                    "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
-                                                    "VISIBLE_COUNT": {name: vc for vc, name in zip(torch.tensor(visible_count).tolist(), image_names)}})
+                                             "PSNR": torch.tensor(psnrs).mean().item(),
+                                             "LPIPS": torch.tensor(lpipss).mean().item()})
+        per_view_dict[scene_dir][method].update({
+            "SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
+            "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
+            "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
+            "VISIBLE_COUNT": {name: vc for vc, name in zip(torch.tensor(visible_count).tolist(), image_names)}})
 
     with open(scene_dir + "/results.json", 'w') as fp:
         json.dump(full_dict[scene_dir], fp, indent=True)
     with open(scene_dir + "/per_view.json", 'w') as fp:
         json.dump(per_view_dict[scene_dir], fp, indent=True)
-    
+
+
 def get_logger(path):
     import logging
 
     logger = logging.getLogger()
-    logger.setLevel(logging.INFO) 
+    logger.setLevel(logging.INFO)
     fileinfo = logging.FileHandler(os.path.join(path, "outputs.log"))
-    fileinfo.setLevel(logging.INFO) 
+    fileinfo.setLevel(logging.INFO)
     controlshow = logging.StreamHandler()
     controlshow.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s - %(levelname)s: %(message)s")
@@ -611,6 +580,7 @@ def get_logger(path):
     logger.addHandler(controlshow)
 
     return logger
+
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -624,78 +594,79 @@ if __name__ == "__main__":
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument('--warmup', action='store_true', default=False)
     parser.add_argument('--use_wandb', action='store_true', default=False)
-    # parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 7_000, 30_000])
-    # parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 7_000, 30_000])
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--gpu", type=str, default = '-1')
+    parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--gpu", type=str, default='-1')
+    # HAC-plus compression parameters
+    parser.add_argument("--log2", type=int, default=13)
+    parser.add_argument("--log2_2D", type=int, default=15)
+    parser.add_argument("--n_features", type=int, default=4)
+    parser.add_argument("--lmbda", type=float, default=0.001)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
-    
     # enable logging
-    
     model_path = args.model_path
     os.makedirs(model_path, exist_ok=True)
 
     logger = get_logger(model_path)
 
-
     logger.info(f'args: {args}')
 
     if args.gpu != '-1':
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
-        os.system("echo $CUDA_VISIBLE_DEVICES")
         logger.info(f'using GPU {args.gpu}')
-
-    
 
     try:
         saveRuntimeCode(os.path.join(args.model_path, 'backup'))
     except:
         logger.info(f'save code failed~')
-        
+
     dataset = args.source_path.split('/')[-1]
-    exp_name = args.model_path.split('/')[-2]
-    
+    exp_name = os.path.basename(os.path.normpath(args.model_path))
+
     if args.use_wandb:
         wandb.login()
         run = wandb.init(
-            # Set the project where this run will be logged
             project=f"Scaffold-GS-{dataset}",
             name=exp_name,
-            # Track hyperparameters and run metadata
             settings=wandb.Settings(start_method="fork"),
             config=vars(args)
         )
     else:
         wandb = None
-    
+
     logger.info("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
+    args.port = np.random.randint(10000, 20000)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    
+
     # training
-    training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb, logger)
+    x_bound_min, x_bound_max = training(args, lp.extract(args), op.extract(args), pp.extract(args), dataset,
+                                         args.test_iterations, args.save_iterations, args.checkpoint_iterations,
+                                         args.start_checkpoint, args.debug_from, wandb, logger)
     if args.warmup:
         logger.info("\n Warmup finished! Reboot from last checkpoints")
         new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args.iterations}', 'point_cloud.ply')
-        training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb=wandb, logger=logger, ply_path=new_ply_path)
+        x_bound_min, x_bound_max = training(args, lp.extract(args), op.extract(args), pp.extract(args), dataset,
+                                             args.test_iterations, args.save_iterations, args.checkpoint_iterations,
+                                             args.start_checkpoint, args.debug_from, wandb=wandb, logger=logger,
+                                             ply_path=new_ply_path)
 
     # All done
     logger.info("\nTraining complete.")
 
     # rendering
     logger.info(f'\nStarting Rendering~')
-    visible_count = render_sets(lp.extract(args), -1, pp.extract(args), wandb=wandb, logger=logger)
+    visible_count = render_sets(args, lp.extract(args), -1, pp.extract(args), wandb=wandb, logger=logger,
+                                x_bound_min=x_bound_min, x_bound_max=x_bound_max)
     logger.info("\nRendering complete.")
 
     # calc metrics
