@@ -410,7 +410,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         visible_count_list.append(visible_count)
 
         # gts
-        gt = view.original_image[0:3, :, :]
+        gt = view.original_image[0:3, :, :].cuda()
 
         # psnr per view
         gt_image = torch.clamp(view.original_image.to("cuda"), 0.0, 1.0)
