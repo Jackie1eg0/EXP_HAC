@@ -3,6 +3,7 @@
 #
 # 包含以下核心组件：
 #   1. MultiResolutionHashGrid  - 多分辨率哈希网格编码 (参考 Instant-NGP)
+#      - 可选 tinycudann 后端 (10x 加速, 需要 pip install tinycudann)
 #   2. ContextMLP               - 带 Intra-anchor 上下文依赖的属性解码器
 #   3. AdaptiveQuantizationModule (AQM) - 可微分自适应量化模块 (STE)
 #   4. EntropyModel             - 参数化熵估计模型
@@ -15,6 +16,17 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 import numpy as np
 import math
+
+# Optional: try to use tinycudann for 10x faster hash grid
+try:
+    import tinycudann as tcnn
+    TCNN_AVAILABLE = True
+    print("[HAC++] tinycudann available — using CUDA-accelerated hash grid")
+except ImportError:
+    TCNN_AVAILABLE = False
+
+# Optional: torch.compile for PyTorch 2.0+ JIT fusion
+_TORCH_COMPILE_AVAILABLE = hasattr(torch, 'compile')
 
 
 # ================================================================
@@ -130,114 +142,126 @@ class MultiResolutionHashGrid(nn.Module):
     # ------------------------------------------------------------------
     def _forward_chunk(self, positions: torch.Tensor) -> torch.Tensor:
         """
-        对一小块位置计算哈希特征 (显存友好的核心实现)。
+        对一小块位置计算哈希特征 (核心实现)。
 
-        使用 int32 索引, 减少 ~50% 的索引张量内存。
-        优化: 内联三线性插值, 最小化中间张量生命周期。
+        优化:
+          - 预计算 bbox_inv_range 避免重复除法
+          - int32 索引减少 ~50% 索引张量内存
+          - 内联三线性插值, 最小化中间张量
 
         Args:
-            positions: [M, 3]  (M << N, 一个 chunk)
+            positions: [M, 3]
         Returns:
             [M, L*F]
         """
         M = positions.shape[0]
         L = self.n_levels
 
-        # 1) 归一化 (inplace clamp 减少一次内存分配)
-        bbox_range = self.bbox_max - self.bbox_min + 1e-8
-        normalized = (positions - self.bbox_min) / bbox_range
-        normalized.clamp_(0.0, 1.0 - 1e-6)
+        # 1) 归一化 (用缓存的逆范围避免每次除法)
+        normalized = (positions - self.bbox_min) * self._bbox_inv_range
+        normalized = torch.clamp(normalized, 0.0, 1.0 - 1e-6)
 
         # 2) 缩放: [M, L, 3]
         scaled = normalized.unsqueeze(1) * self.resolutions_float.view(1, L, 1)
-        del normalized
 
         # 3) 整数部分 (int32!) & 小数部分
-        floor_coords = torch.floor(scaled).int()  # int32, 非 int64
+        floor_coords = torch.floor(scaled).int()
         frac = scaled - floor_coords.float()
-        del scaled
 
         # 4) 8 个角: [M, L, 8, 3] (int32)
         corners = floor_coords.unsqueeze(2) + self.corner_offsets.int().view(1, 1, 8, 3)
-        del floor_coords
 
-        # 5) 空间哈希: [M, L, 8] (int32)
+        # 5) 空间哈希: [M, L, 8] — 使用预缓存的 level_arange
         hash_idx = self._spatial_hash(corners)
-        del corners  # 释放最大的中间张量
 
-        # 6) 层级索引: [1, L, 1] (int32)
-        level_idx = torch.arange(L, device=positions.device, dtype=torch.int32).view(1, L, 1).expand(M, L, 8)
+        # 6) 查表: [M, L, 8, F] — 使用预缓存的 level index
+        if M == self._cached_level_M and L == self._cached_level_L:
+            level_idx = self._cached_level_idx
+        else:
+            level_idx = torch.arange(L, device=positions.device, dtype=torch.int32).view(1, L, 1).expand(M, L, 8)
+            # 只缓存较小尺寸避免爆内存
+            if M <= 65536:
+                self._cached_level_idx = level_idx
+                self._cached_level_M = M
+                self._cached_level_L = L
 
-        # 7) 查表: [M, L, 8, F]
         corner_feats = self.hash_tables[level_idx.long(), hash_idx.long()]
-        del level_idx, hash_idx
 
-        # 8) 三线性插值 (优化: 提取分量后立即 del frac)
+        # 7) 三线性插值
         fx = frac[..., 0:1]
         fy = frac[..., 1:2]
         fz = frac[..., 2:3]
-        del frac
 
-        # 沿 z 轴插值 (4 对 → 4 个结果)
-        w_z = fz  # [M, L, 1]
-        c00 = torch.lerp(corner_feats[:, :, 0], corner_feats[:, :, 1], w_z)
-        c01 = torch.lerp(corner_feats[:, :, 2], corner_feats[:, :, 3], w_z)
-        c10 = torch.lerp(corner_feats[:, :, 4], corner_feats[:, :, 5], w_z)
-        c11 = torch.lerp(corner_feats[:, :, 6], corner_feats[:, :, 7], w_z)
-        del corner_feats, w_z
+        c00 = torch.lerp(corner_feats[:, :, 0], corner_feats[:, :, 1], fz)
+        c01 = torch.lerp(corner_feats[:, :, 2], corner_feats[:, :, 3], fz)
+        c10 = torch.lerp(corner_feats[:, :, 4], corner_feats[:, :, 5], fz)
+        c11 = torch.lerp(corner_feats[:, :, 6], corner_feats[:, :, 7], fz)
 
-        # 沿 y 轴插值 (2 对 → 2 个结果)
         c0 = torch.lerp(c00, c01, fy)
         c1 = torch.lerp(c10, c11, fy)
-        del c00, c01, c10, c11
 
-        # 沿 x 轴插值 (最终结果)
         result = torch.lerp(c0, c1, fx)
-        del c0, c1
 
         return result.reshape(M, -1)
 
     # ------------------------------------------------------------------
-    def forward(self, positions: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
+    def _update_bbox_cache(self):
+        """Pre-compute inverse bbox range for fast normalization."""
+        self._bbox_inv_range = 1.0 / (self.bbox_max - self.bbox_min + 1e-8)
+        # Reset level index cache
+        self._cached_level_idx = None
+        self._cached_level_M = -1
+        self._cached_level_L = -1
+
+    # ------------------------------------------------------------------
+    def forward(self, positions: torch.Tensor, chunk_size: int = 65536) -> torch.Tensor:
         """
-        显存优化的前向传播: 分块处理 + 梯度检查点。
+        高性能前向传播。
 
-        策略:
-          - 将 N 个锚点分成 chunk_size 大小的块
-          - 每个块用 torch.utils.checkpoint 包裹 → 前向时不存储中间张量
-          - 反向时逐块重算 → 峰值显存仅为 1 个块的大小
+        性能优化 (相比旧版本):
+          - chunk_size: 1024 → 65536 (减少 ~64x Python 循环开销)
+          - 梯度检查点: 仅在 N > 100K 时启用 (大多数场景不需要)
+          - 预缓存 bbox_inv_range 和 level_idx
 
-        显存对比 (N=37K, L=16, chunk=4096):
-          旧方案: ~500 MB 中间张量 (全部同时在显存)
-          新方案: ~ 30 MB 峰值 (仅 1 个 chunk)
+        显存估算 (N=37K, L=16, F=4):
+          corners [M,16,8,3]*int32 = ~57 MB
+          corner_feats [M,16,8,4]*fp32 = ~76 MB
+          峰值 ~200 MB — 对 8GB+ 显卡完全可接受
 
         Args:
             positions:  [N, 3]  世界坐标
-            chunk_size: 每块大小, 越小越省显存但越慢
+            chunk_size: 每块大小 (默认 65536, 大多数场景一次完成)
         Returns:
             features: [N, L*F]
         """
+        # Lazy-init bbox cache
+        if not hasattr(self, '_bbox_inv_range') or self._bbox_inv_range is None:
+            self._update_bbox_cache()
+
         N = positions.shape[0]
 
-        # 小数据: 直接计算, 不分块
+        # 小数据 (大多数场景): 直接计算, 零开销
         if N <= chunk_size:
             return self._forward_chunk(positions)
 
         if not torch.is_grad_enabled():
-            # 推理模式: 仍然分块以控制峰值显存, 但不需要梯度检查点
+            # 推理模式: 分块但不需要 checkpoint
             outputs = []
             for i in range(0, N, chunk_size):
                 outputs.append(self._forward_chunk(positions[i:i + chunk_size]))
             return torch.cat(outputs, dim=0)
 
-        # 训练模式: 分块 + 梯度检查点
+        # 训练模式: 仅在超大场景 (N > 100K) 时用 gradient checkpoint 节省显存
+        use_checkpoint = (N > 100000)
         outputs = []
         for i in range(0, N, chunk_size):
             chunk_pos = positions[i:i + chunk_size]
-            # grad_checkpoint: 前向不存中间张量, 反向时重算
-            chunk_out = grad_checkpoint(
-                self._forward_chunk, chunk_pos, use_reentrant=False
-            )
+            if use_checkpoint:
+                chunk_out = grad_checkpoint(
+                    self._forward_chunk, chunk_pos, use_reentrant=False
+                )
+            else:
+                chunk_out = self._forward_chunk(chunk_pos)
             outputs.append(chunk_out)
 
         return torch.cat(outputs, dim=0)
@@ -256,6 +280,95 @@ class MultiResolutionHashGrid(nn.Module):
         extent = (pmax - pmin).clamp(min=1e-6)
         self.bbox_min.copy_(pmin - margin * extent)
         self.bbox_max.copy_(pmax + margin * extent)
+        self._update_bbox_cache()
+
+
+# ================================================================
+#  1b. TinyCUDANN Hash Grid Wrapper (optional 10x speedup)
+# ================================================================
+
+class TcnnHashGrid(nn.Module):
+    """
+    Wrapper around tinycudann's HashEncoding for drop-in replacement.
+
+    Same interface as MultiResolutionHashGrid but uses CUDA-optimized
+    implementation from tiny-cuda-nn (Müller et al., 2022).
+
+    Requires: pip install tinycudann (or git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch)
+    """
+
+    def __init__(
+        self,
+        n_levels: int = 16,
+        n_features_per_level: int = 2,
+        log2_hashmap_size: int = 19,
+        base_resolution: int = 16,
+        max_resolution: int = 2048,
+    ):
+        super().__init__()
+        assert TCNN_AVAILABLE, "tinycudann not installed"
+
+        self.n_levels = n_levels
+        self.n_features_per_level = n_features_per_level
+        self.log2_hashmap_size = log2_hashmap_size
+        self.hashmap_size = 2 ** log2_hashmap_size
+        self.output_dim = n_levels * n_features_per_level
+
+        # tinycudann encoding config
+        self.encoding = tcnn.Encoding(
+            n_input_dims=3,
+            encoding_config={
+                "otype": "HashGrid",
+                "n_levels": n_levels,
+                "n_features_per_level": n_features_per_level,
+                "log2_hashmap_size": log2_hashmap_size,
+                "base_resolution": base_resolution,
+                "per_level_scale": math.exp(
+                    (math.log(max_resolution) - math.log(base_resolution)) / max(n_levels - 1, 1)
+                ),
+            },
+        )
+
+        # AABB for normalization (same interface)
+        self.register_buffer('bbox_min', torch.tensor([-1.0, -1.0, -1.0]))
+        self.register_buffer('bbox_max', torch.tensor([1.0, 1.0, 1.0]))
+
+        # Expose hash_tables property for binary entropy estimation
+        # tcnn stores params as a flat fp16 buffer; we wrap it
+        self._hash_tables_proxy = None
+
+    @property
+    def hash_tables(self):
+        """Return the raw hash table parameters for entropy estimation.
+        Shape: [L*T*F] flat → view as [L, T, F] for compatibility."""
+        return self.encoding.params.view(
+            self.n_levels, self.hashmap_size, self.n_features_per_level).float()
+
+    def forward(self, positions: torch.Tensor, chunk_size: int = 65536) -> torch.Tensor:
+        """
+        Forward pass: normalize to [0,1] then call tcnn encoding.
+
+        Args:
+            positions: [N, 3] world coordinates
+            chunk_size: ignored (tcnn handles internally)
+        Returns:
+            [N, L*F] features
+        """
+        # Normalize to [0, 1]
+        normalized = (positions - self.bbox_min) / (self.bbox_max - self.bbox_min + 1e-8)
+        normalized = torch.clamp(normalized, 0.0, 1.0 - 1e-6)
+        # tcnn returns fp16 by default; convert to fp32
+        return self.encoding(normalized).float()
+
+    def update_bbox(self, points: torch.Tensor, margin: float = 0.1):
+        pmin = points.min(dim=0)[0]
+        pmax = points.max(dim=0)[0]
+        extent = (pmax - pmin).clamp(min=1e-6)
+        self.bbox_min.copy_(pmin - margin * extent)
+        self.bbox_max.copy_(pmax + margin * extent)
+
+    def _update_bbox_cache(self):
+        pass  # tcnn handles normalization internally
 
 
 # ================================================================

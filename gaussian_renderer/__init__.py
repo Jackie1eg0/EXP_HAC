@@ -66,25 +66,33 @@ def generate_neural_gaussians(viewpoint_camera, pc: GaussianModel, visible_mask=
 
         # Phase 3: (10000, end) — adaptive quantization + entropy estimation
         if step > 10000:
-            # For rendering: adaptive Q noise on visible anchors
+            # ---- Pre-cache global means (avoid recomputing per-call) ----
+            _feat_mean = pc._anchor_feat.mean().detach()
+            _scaling_mean = pc.get_scaling.mean().detach()
+            _offset_mean = pc._offset.mean().detach()
+
+            # ---- SPLIT SIZES (reused below) ----
+            _split_sizes = [
+                pc.feat_dim, pc.feat_dim, pc.feat_dim,
+                6, 6,
+                3 * pc.n_offsets, 3 * pc.n_offsets,
+                1, 1, 1
+            ]
+
+            # ---- For rendering: adaptive Q noise on visible anchors ----
             feat_context_orig = pc.calc_interp_feat(anchor)
             feat_context = pc.get_grid_mlp(feat_context_orig)
-            mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
-                torch.split(feat_context, split_size_or_sections=[
-                    pc.feat_dim, pc.feat_dim, pc.feat_dim,
-                    6, 6,
-                    3 * pc.n_offsets, 3 * pc.n_offsets,
-                    1, 1, 1
-                ], dim=-1)
+            _, _, _, _, _, _, _, Q_feat_adj_vis, Q_scaling_adj_vis, Q_offsets_adj_vis = \
+                torch.split(feat_context, split_size_or_sections=_split_sizes, dim=-1)
 
-            Q_feat = Q_feat * (1 + torch.tanh(Q_feat_adj))
-            Q_scaling = Q_scaling * (1 + torch.tanh(Q_scaling_adj))
-            Q_offsets = Q_offsets * (1 + torch.tanh(Q_offsets_adj))
+            Q_feat = Q_feat * (1 + torch.tanh(Q_feat_adj_vis))
+            Q_scaling = Q_scaling * (1 + torch.tanh(Q_scaling_adj_vis))
+            Q_offsets = Q_offsets * (1 + torch.tanh(Q_offsets_adj_vis))
             feat = feat + torch.empty_like(feat).uniform_(-0.5, 0.5) * Q_feat
             grid_scaling = grid_scaling + torch.empty_like(grid_scaling).uniform_(-0.5, 0.5) * Q_scaling
             grid_offsets = grid_offsets + torch.empty_like(grid_offsets).uniform_(-0.5, 0.5) * Q_offsets.unsqueeze(1)
 
-            # For entropy estimation: sample 5% of ALL anchors
+            # ---- For entropy estimation: sample 5% of ALL anchors ----
             choose_idx = torch.rand_like(pc.get_anchor[:, 0]) <= 0.05
             anchor_chosen = pc.get_anchor[choose_idx]
             feat_chosen = pc._anchor_feat[choose_idx]
@@ -96,43 +104,34 @@ def generate_neural_gaussians(viewpoint_camera, pc: GaussianModel, visible_mask=
             feat_context_orig = pc.calc_interp_feat(anchor_chosen)
             feat_context = pc.get_grid_mlp(feat_context_orig)
             mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
-                torch.split(feat_context, split_size_or_sections=[
-                    pc.feat_dim, pc.feat_dim, pc.feat_dim,
-                    6, 6,
-                    3 * pc.n_offsets, 3 * pc.n_offsets,
-                    1, 1, 1
-                ], dim=-1)
+                torch.split(feat_context, split_size_or_sections=_split_sizes, dim=-1)
 
-            Q_feat_e = 1
-            Q_scaling_e = 0.001
-            Q_offsets_e = 0.2
-            Q_feat_adj = Q_feat_adj.contiguous().repeat(1, mean.shape[-1])
-            Q_scaling_adj = Q_scaling_adj.contiguous().repeat(1, mean_scaling.shape[-1])
-            Q_offsets_adj = Q_offsets_adj.contiguous().repeat(1, mean_offsets.shape[-1])
-            Q_feat_e = Q_feat_e * (1 + torch.tanh(Q_feat_adj))
-            Q_scaling_e = Q_scaling_e * (1 + torch.tanh(Q_scaling_adj))
-            Q_offsets_e = Q_offsets_e * (1 + torch.tanh(Q_offsets_adj)).view(-1, pc.n_offsets, 3)
+            Q_feat_adj = Q_feat_adj.contiguous().expand_as(mean)
+            Q_scaling_adj = Q_scaling_adj.contiguous().expand_as(mean_scaling)
+            Q_offsets_adj = Q_offsets_adj.contiguous().expand_as(mean_offsets)
+            Q_feat_e = 1.0 * (1 + torch.tanh(Q_feat_adj))
+            Q_scaling_e = 0.001 * (1 + torch.tanh(Q_scaling_adj))
+            Q_offsets_e = (0.2 * (1 + torch.tanh(Q_offsets_adj))).view(-1, pc.n_offsets, 3)
 
             feat_chosen = feat_chosen + torch.empty_like(feat_chosen).uniform_(-0.5, 0.5) * Q_feat_e
             mean_adj, scale_adj, prob_adj = pc.get_deform_mlp.forward(feat_chosen, torch.cat([mean, scale, prob], dim=-1))
-            probs = torch.stack([prob, prob_adj], dim=-1)
-            probs = torch.softmax(probs, dim=-1)
+            probs = torch.softmax(torch.stack([prob, prob_adj], dim=-1), dim=-1)
 
             grid_scaling_chosen = grid_scaling_chosen + torch.empty_like(grid_scaling_chosen).uniform_(-0.5, 0.5) * Q_scaling_e
             grid_offsets_chosen = grid_offsets_chosen + torch.empty_like(grid_offsets_chosen).uniform_(-0.5, 0.5) * Q_offsets_e
             grid_offsets_chosen = grid_offsets_chosen.view(-1, 3 * pc.n_offsets)
-            binary_grid_masks_chosen = binary_grid_masks_chosen.repeat(1, 1, 3).view(-1, 3 * pc.n_offsets)
+            binary_grid_masks_chosen = binary_grid_masks_chosen.expand(-1, -1, 3).reshape(-1, 3 * pc.n_offsets)
 
             bit_feat = pc.EG_mix_prob_2.forward(feat_chosen,
                                                 mean, mean_adj,
                                                 scale, scale_adj,
                                                 probs[..., 0], probs[..., 1],
-                                                Q=Q_feat_e, x_mean=pc._anchor_feat.mean())
+                                                Q=Q_feat_e, x_mean=_feat_mean)
             bit_feat = bit_feat * mask_anchor_chosen
-            bit_scaling = pc.entropy_gaussian.forward(grid_scaling_chosen, mean_scaling, scale_scaling, Q_scaling_e, pc.get_scaling.mean())
+            bit_scaling = pc.entropy_gaussian.forward(grid_scaling_chosen, mean_scaling, scale_scaling, Q_scaling_e, _scaling_mean)
             bit_scaling = bit_scaling * mask_anchor_chosen
             bit_offsets = pc.entropy_gaussian.forward(grid_offsets_chosen, mean_offsets, scale_offsets,
-                                                     Q_offsets_e.view(-1, 3 * pc.n_offsets), pc._offset.mean())
+                                                     Q_offsets_e.view(-1, 3 * pc.n_offsets), _offset_mean)
             bit_offsets = bit_offsets * mask_anchor_chosen * binary_grid_masks_chosen
 
             bit_per_feat_param = torch.sum(bit_feat) / bit_feat.numel()

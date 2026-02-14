@@ -30,7 +30,9 @@ from utils.graphics_utils import BasicPointCloud
 from utils.system_utils import mkdir_p
 from utils.encodings import STE_binary, STE_multistep, get_binary_vxl_size
 from utils.entropy_models import Entropy_gaussian, Entropy_gaussian_mix_prob_2
-from scene.hac_modules import MultiResolutionHashGrid
+from scene.hac_modules import MultiResolutionHashGrid, TCNN_AVAILABLE
+if TCNN_AVAILABLE:
+    from scene.hac_modules import TcnnHashGrid
 
 
 # ================================================================
@@ -207,14 +209,21 @@ class GaussianModel:
 
         # ============================================================
         #  Hash Grid Encoding (for entropy context ONLY, not rendering)
+        #  Auto-select: tinycudann (if available) > PyTorch fallback
         # ============================================================
-        self.encoding_xyz = MultiResolutionHashGrid(
+        _hash_args = dict(
             n_levels=hash_n_levels,
             n_features_per_level=hash_n_features_per_level,
             log2_hashmap_size=hash_log2_hashmap_size,
             base_resolution=hash_base_resolution,
             max_resolution=hash_max_resolution,
-        ).cuda()
+        )
+        if TCNN_AVAILABLE:
+            self.encoding_xyz = TcnnHashGrid(**_hash_args).cuda()
+            print(f"[GaussianModel] Using tinycudann hash grid (CUDA-accelerated)")
+        else:
+            self.encoding_xyz = MultiResolutionHashGrid(**_hash_args).cuda()
+            print(f"[GaussianModel] Using PyTorch hash grid (optimized)")
 
         # ============================================================
         #  Standard Scaffold-GS MLPs (all attributes directly optimized)
@@ -424,6 +433,8 @@ class GaussianModel:
         # Also update the hash grid bbox to match
         self.encoding_xyz.bbox_min.copy_(x_bound_min.squeeze(0))
         self.encoding_xyz.bbox_max.copy_(x_bound_max.squeeze(0))
+        # Invalidate cached inverse range for fast normalization
+        self.encoding_xyz._update_bbox_cache()
         print('anchor_bound_updated')
 
     def calc_interp_feat(self, x):
