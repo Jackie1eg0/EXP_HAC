@@ -450,7 +450,7 @@ def render_sets(args_param, dataset: ModelParams, iteration: int, pipeline: Pipe
             dataset.use_feat_bank,
             hash_n_features_per_level=args_param.n_features,
             hash_log2_hashmap_size=args_param.log2,
-            decoded_version=True,
+            decoded_version=False,   # MUST be False: get_scaling needs exp() activation
             is_synthetic_nerf=is_synthetic_nerf,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -458,6 +458,19 @@ def render_sets(args_param, dataset: ModelParams, iteration: int, pipeline: Pipe
         if x_bound_min is not None:
             gaussians.x_bound_min = x_bound_min
             gaussians.x_bound_max = x_bound_max
+            # Also update hash grid bbox for correct STE quantization during inference
+            gaussians.encoding_xyz.bbox_min.copy_(x_bound_min.squeeze(0))
+            gaussians.encoding_xyz.bbox_max.copy_(x_bound_max.squeeze(0))
+            gaussians.encoding_xyz._update_bbox_cache()
+        else:
+            # --skip_train mode: bbox already restored from entropy_checkpoints.pth
+            # Sync gaussians.x_bound_min/max from the loaded hash grid bbox
+            gaussians.x_bound_min = gaussians.encoding_xyz.bbox_min.unsqueeze(0)
+            gaussians.x_bound_max = gaussians.encoding_xyz.bbox_max.unsqueeze(0)
+            gaussians.encoding_xyz._update_bbox_cache()
+            if logger:
+                logger.info(f"[render_sets] bbox restored from checkpoint: "
+                            f"min={gaussians.x_bound_min}, max={gaussians.x_bound_max}")
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -600,6 +613,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--gpu", type=str, default='-1')
+    parser.add_argument("--skip_train", action='store_true', default=False,
+                        help="Skip training, only run rendering and evaluation from saved checkpoint")
     # HAC-plus compression parameters
     parser.add_argument("--log2", type=int, default=13)
     parser.add_argument("--log2_2D", type=int, default=15)
@@ -648,20 +663,24 @@ if __name__ == "__main__":
     args.port = np.random.randint(10000, 20000)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    # training
-    x_bound_min, x_bound_max = training(args, lp.extract(args), op.extract(args), pp.extract(args), dataset,
-                                         args.test_iterations, args.save_iterations, args.checkpoint_iterations,
-                                         args.start_checkpoint, args.debug_from, wandb, logger)
-    if args.warmup:
-        logger.info("\n Warmup finished! Reboot from last checkpoints")
-        new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args.iterations}', 'point_cloud.ply')
+    if not args.skip_train:
+        # training
         x_bound_min, x_bound_max = training(args, lp.extract(args), op.extract(args), pp.extract(args), dataset,
                                              args.test_iterations, args.save_iterations, args.checkpoint_iterations,
-                                             args.start_checkpoint, args.debug_from, wandb=wandb, logger=logger,
-                                             ply_path=new_ply_path)
+                                             args.start_checkpoint, args.debug_from, wandb, logger)
+        if args.warmup:
+            logger.info("\n Warmup finished! Reboot from last checkpoints")
+            new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args.iterations}', 'point_cloud.ply')
+            x_bound_min, x_bound_max = training(args, lp.extract(args), op.extract(args), pp.extract(args), dataset,
+                                                 args.test_iterations, args.save_iterations, args.checkpoint_iterations,
+                                                 args.start_checkpoint, args.debug_from, wandb=wandb, logger=logger,
+                                                 ply_path=new_ply_path)
 
-    # All done
-    logger.info("\nTraining complete.")
+        # All done
+        logger.info("\nTraining complete.")
+    else:
+        logger.info("\n--skip_train enabled, skipping training phase.")
+        x_bound_min, x_bound_max = None, None
 
     # rendering
     logger.info(f'\nStarting Rendering~')
