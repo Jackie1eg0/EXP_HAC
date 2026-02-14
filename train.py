@@ -45,7 +45,15 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
 # torch.set_num_threads(32)
-lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
+# 延迟加载 lpips 到 GPU: 仅在评估时使用, 训练期间不占用显存
+lpips_fn = None
+
+def get_lpips_fn():
+    """延迟加载 LPIPS 模型到 GPU，节省训练阶段约 100MB 显存。"""
+    global lpips_fn
+    if lpips_fn is None:
+        lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
+    return lpips_fn
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -114,6 +122,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = create_gaussian_model(dataset)
+    
+    # [显存优化] 在创建 Scene 前清理缓存
+    torch.cuda.empty_cache()
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -122,6 +133,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
+
+    # [显存优化] 预先创建 background tensor, 避免每次迭代重新分配
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -172,9 +187,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     f"\n[HAC++ iter {iteration}] Full mode ON "
                     f"(hash grid + adaptive Q + entropy loss).")
 
-        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
         
         # Pick a random Camera
         if not viewpoint_stack:
@@ -185,7 +197,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         if (iteration - 1) == debug_from:
             pipe.debug = True
         
-        voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
+        voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
         
@@ -257,6 +269,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         loss.backward()
         
+        # [显存优化] 及时释放不再需要的中间变量 (Ll1 需保留到 training_report)
+        del render_pkg, gt_image, ssim_loss, scaling_reg
+        
         iter_end.record()
 
         with torch.no_grad():
@@ -275,6 +290,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     f'{dataset_name}/train_loss_patches/hac_loss',
                     loss_hac.item(), iteration)
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
+            del Ll1  # training_report 使用后释放
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -309,6 +325,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+            
+            # [显存优化] 定期清理碎片化显存
+            if iteration % 1000 == 0:
+                torch.cuda.empty_cache()
+                
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
@@ -431,7 +452,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 
         # gts
-        gt = view.original_image[0:3, :, :]
+        gt = view.original_image[0:3, :, :].cuda()
         
         # error maps
         errormap = (rendering - gt).abs()
@@ -539,7 +560,7 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
         for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
             ssims.append(ssim(renders[idx], gts[idx]))
             psnrs.append(psnr(renders[idx], gts[idx]))
-            lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
+            lpipss.append(get_lpips_fn()(renders[idx], gts[idx]).detach())
         
         if wandb is not None:
             wandb.log({"test_SSIMS":torch.stack(ssims).mean().item(), })

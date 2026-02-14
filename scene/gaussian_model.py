@@ -21,6 +21,39 @@ from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
+from scipy.spatial import cKDTree
+
+
+def safe_distCUDA2(points_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    显存安全的 KNN 距离计算。
+    
+    优先使用 CUDA 加速的 distCUDA2，如果 OOM 则自动回退到 CPU 端 scipy cKDTree。
+    
+    Args:
+        points_tensor: [N, 3] float tensor (在 GPU 上)
+    Returns:
+        [N] float tensor (在 GPU 上) — 每个点到最近 3 邻居的平均距离
+    """
+    try:
+        dist2 = distCUDA2(points_tensor).float().cuda()
+        return dist2
+    except (RuntimeError, MemoryError) as e:
+        if 'out of memory' in str(e).lower() or 'bad_alloc' in str(e).lower() or isinstance(e, MemoryError):
+            print(f"[Memory] distCUDA2 OOM ({points_tensor.shape[0]} points), falling back to CPU KDTree...")
+            torch.cuda.empty_cache()
+            
+            points_np = points_tensor.detach().cpu().numpy().astype(np.float64)
+            tree = cKDTree(points_np)
+            # k=4 因为第一个邻居是自身 (距离=0)
+            dists, _ = tree.query(points_np, k=4)
+            # 取 k=1,2,3 (跳过自身), 计算平均距离的平方
+            mean_dist_sq = np.mean(dists[:, 1:4] ** 2, axis=1).astype(np.float32)
+            
+            del points_np, tree, dists
+            return torch.from_numpy(mean_dist_sq).float().cuda()
+        else:
+            raise
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
 from scene.hac_model import BinaryHashGrid, HACContextModel
@@ -504,18 +537,26 @@ class GaussianModel:
         HAC++ 模式下这些属性不再是独立可优化参数，而是由网络解码得到，
         但 growing/pruning 等操作仍需读取其当前值。
         
-        注意: 此操作应在 torch.no_grad() 下运行，且不会太频繁调用。
+        [显存优化] 分块解码，避免一次性解码全部锚点导致显存峰值过高。
         """
         if not self.use_hash_grid:
             return
         
         with torch.no_grad():
-            decoded, _ = self.decode_anchor_attributes(self._anchor, is_training=False)
-            self._anchor_feat.data.copy_(decoded['anchor_feat'])
-            self._offset.data.copy_(decoded['offsets'].view(-1, self.n_offsets, 3))
-            self._scaling.data.copy_(decoded['scaling'])
-            self._rotation.data.copy_(decoded['rotation'])
-            self._opacity.data.copy_(decoded['opacity'])
+            N = self._anchor.shape[0]
+            chunk_size = 4096  # 分块处理减少峰值显存
+            
+            for i in range(0, N, chunk_size):
+                end = min(i + chunk_size, N)
+                decoded, _ = self.decode_anchor_attributes(
+                    self._anchor[i:end], is_training=False, chunk_size=chunk_size
+                )
+                self._anchor_feat.data[i:end].copy_(decoded['anchor_feat'])
+                self._offset.data[i:end].copy_(decoded['offsets'].view(-1, self.n_offsets, 3))
+                self._scaling.data[i:end].copy_(decoded['scaling'])
+                self._rotation.data[i:end].copy_(decoded['rotation'])
+                self._opacity.data[i:end].copy_(decoded['opacity'])
+                del decoded
 
     def voxelize_sample(self, data=None, voxel_size=0.01):
         np.random.shuffle(data)
@@ -529,7 +570,7 @@ class GaussianModel:
 
         if self.voxel_size <= 0:
             init_points = torch.tensor(points).float().cuda()
-            init_dist = distCUDA2(init_points).float().cuda()
+            init_dist = safe_distCUDA2(init_points)
             median_dist, _ = torch.kthvalue(init_dist, int(init_dist.shape[0]*0.5))
             self.voxel_size = median_dist.item()
             del init_dist
@@ -544,8 +585,9 @@ class GaussianModel:
         
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud).float().cuda(), 0.0000001)
+        dist2 = torch.clamp_min(safe_distCUDA2(fused_point_cloud), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6)
+        del dist2  # 不再需要
         
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1

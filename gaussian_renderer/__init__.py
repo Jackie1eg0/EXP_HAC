@@ -197,8 +197,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    # 释放 PyTorch 缓存的未使用显存, 为光栅化器的大缓冲区腾空间
-    torch.cuda.empty_cache()
+    # [显存优化] 仅在显存碎片化严重时清理缓存 (避免每次迭代都清理的开销)
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    if free_mem / total_mem < 0.2:  # 可用显存低于 20% 时清理
+        torch.cuda.empty_cache()
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii = rasterizer(

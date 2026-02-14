@@ -133,6 +133,7 @@ class MultiResolutionHashGrid(nn.Module):
         对一小块位置计算哈希特征 (显存友好的核心实现)。
 
         使用 int32 索引, 减少 ~50% 的索引张量内存。
+        优化: 内联三线性插值, 最小化中间张量生命周期。
 
         Args:
             positions: [M, 3]  (M << N, 一个 chunk)
@@ -142,19 +143,23 @@ class MultiResolutionHashGrid(nn.Module):
         M = positions.shape[0]
         L = self.n_levels
 
-        # 1) 归一化
-        normalized = (positions - self.bbox_min) / (self.bbox_max - self.bbox_min + 1e-8)
-        normalized = torch.clamp(normalized, 0.0, 1.0 - 1e-6)
+        # 1) 归一化 (inplace clamp 减少一次内存分配)
+        bbox_range = self.bbox_max - self.bbox_min + 1e-8
+        normalized = (positions - self.bbox_min) / bbox_range
+        normalized.clamp_(0.0, 1.0 - 1e-6)
 
         # 2) 缩放: [M, L, 3]
         scaled = normalized.unsqueeze(1) * self.resolutions_float.view(1, L, 1)
+        del normalized
 
         # 3) 整数部分 (int32!) & 小数部分
         floor_coords = torch.floor(scaled).int()  # int32, 非 int64
         frac = scaled - floor_coords.float()
+        del scaled
 
         # 4) 8 个角: [M, L, 8, 3] (int32)
         corners = floor_coords.unsqueeze(2) + self.corner_offsets.int().view(1, 1, 8, 3)
+        del floor_coords
 
         # 5) 空间哈希: [M, L, 8] (int32)
         hash_idx = self._spatial_hash(corners)
@@ -167,23 +172,27 @@ class MultiResolutionHashGrid(nn.Module):
         corner_feats = self.hash_tables[level_idx.long(), hash_idx.long()]
         del level_idx, hash_idx
 
-        # 8) 三线性插值
+        # 8) 三线性插值 (优化: 提取分量后立即 del frac)
         fx = frac[..., 0:1]
         fy = frac[..., 1:2]
         fz = frac[..., 2:3]
         del frac
 
-        c00 = corner_feats[:, :, 0] * (1 - fz) + corner_feats[:, :, 1] * fz
-        c01 = corner_feats[:, :, 2] * (1 - fz) + corner_feats[:, :, 3] * fz
-        c10 = corner_feats[:, :, 4] * (1 - fz) + corner_feats[:, :, 5] * fz
-        c11 = corner_feats[:, :, 6] * (1 - fz) + corner_feats[:, :, 7] * fz
-        del corner_feats
+        # 沿 z 轴插值 (4 对 → 4 个结果)
+        w_z = fz  # [M, L, 1]
+        c00 = torch.lerp(corner_feats[:, :, 0], corner_feats[:, :, 1], w_z)
+        c01 = torch.lerp(corner_feats[:, :, 2], corner_feats[:, :, 3], w_z)
+        c10 = torch.lerp(corner_feats[:, :, 4], corner_feats[:, :, 5], w_z)
+        c11 = torch.lerp(corner_feats[:, :, 6], corner_feats[:, :, 7], w_z)
+        del corner_feats, w_z
 
-        c0 = c00 * (1 - fy) + c01 * fy
-        c1 = c10 * (1 - fy) + c11 * fy
+        # 沿 y 轴插值 (2 对 → 2 个结果)
+        c0 = torch.lerp(c00, c01, fy)
+        c1 = torch.lerp(c10, c11, fy)
         del c00, c01, c10, c11
 
-        result = c0 * (1 - fx) + c1 * fx
+        # 沿 x 轴插值 (最终结果)
+        result = torch.lerp(c0, c1, fx)
         del c0, c1
 
         return result.reshape(M, -1)
