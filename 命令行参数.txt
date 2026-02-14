@@ -1,0 +1,32 @@
+1)单场景训练对比：
+cd F:\Desktop\Gaussian Splatting相关\Cursor_Improve\SG_EXP1\EXP_HAC
+
+# 完整训练 + 评测 + 绘图（flowers 场景）
+python compare_experiments.py --scene flowers --data_root data/mipnerf360 --gpu 0
+
+# 自定义 lambda 做消融
+python compare_experiments.py --scene flowers --data_root data/mipnerf360 --lambda_rates 5e-4 1e-3 2e-3 --gpu 0
+
+# 只收集已有结果并生成图表（不重新训练）
+python compare_experiments.py --scene flowers --data_root data/mipnerf360 --collect_only
+
+2)手动分布训练:
+# Step 1: 基线 Scaffold-GS（lmbda=0, 无压缩约束）
+python train.py -s data/mipnerf360/flowers -m outputs/flowers/scaffold_gs --eval --lmbda 0 --iterations 30000 --test_iterations 30000 --save_iterations 30000
+
+# Step 2: HAC++ 不同压缩强度
+python train.py -s data/mipnerf360/flowers -m outputs/flowers/hac_lmbda5e-04 --eval --lmbda 0.0005 --iterations 30000 --test_iterations 30000 --save_iterations 30000
+
+python train.py -s data/mipnerf360/flowers -m outputs/flowers/hac_lmbda1e-03 --eval --lmbda 0.001 --iterations 30000 --test_iterations 30000 --save_iterations 30000
+
+python train.py -s data/mipnerf360/flowers -m outputs/flowers/hac_lmbda2e-03 --eval --lmbda 0.002 --iterations 30000 --test_iterations 30000 --save_iterations 30000
+
+3)详细评估对比(训练完成后)：
+python evaluation_hac_plus.py \
+    --source_path data/mipnerf360/flowers \
+    --scaffold_model outputs/flowers/scaffold_gs \
+    --hac_models outputs/flowers/hac_lmbda5e-04 outputs/flowers/hac_lmbda1e-03 outputs/flowers/hac_lmbda2e-03 \
+    --hac_lambdas 0.0005 0.001 0.002 \
+    --output_dir evaluation_results/flowers \
+    --log2 13 --n_features 4
+    
